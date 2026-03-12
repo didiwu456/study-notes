@@ -1,0 +1,110 @@
+  ---
+  Authorization Models Used in the k6 Load Tests
+
+  Each scenario uses a different model, defined inline in the test script. There is no single "the model" — it varies by
+   what's being exercised.
+
+  ---
+  1. check-direct.js — Simple flat model (no traversal)
+
+  Used for the 1,919 req/s Check and 96% cache hit measurements.
+
+  type user
+
+  type document
+    relations
+      define owner:  [user]          ← This (direct)
+      define editor: [user]          ← This (direct)
+      define viewer: [user]          ← This (direct)
+
+  Data: 1,000 users × 100 documents. Each user gets direct access to ~10 objects (~10,000 tuples total). Checks are
+  random (user, relation, object) — many will be allowed: false, which is fast.
+
+  ---
+  2. check-computed.js / complex-unions.json — 5-branch union (the ADR-003 parallel traversal test)
+
+  type user
+  type group
+    relations
+      define member: [user]
+
+  type resource
+    relations
+      define owner:       [user]
+      define admin:       [user, group#member] or owner
+      define editor:      [user, group#member] or admin
+      define contributor: [user]
+      define commenter:   [user]
+      define reviewer:    [user]
+      define viewer:      [user] or editor or contributor or commenter or reviewer
+
+  viewer has 5 union branches, some of which chain further (viewer → editor → admin → owner = 3 levels deep). 500 users,
+   50 groups, 100 resources. All checks are against viewer.
+
+  ---
+  3. mixed-workload.js — Folder/document hierarchy with TupleToUserset
+
+  The model used for the mixed workload (60% check, 25% batch, 10% list, 5% write):
+
+  type user
+  type group
+    relations
+      define member: [user]
+
+  type folder
+    relations
+      define owner:  [user]
+      define viewer: [user, group#member] or owner
+
+  type document
+    relations
+      define parent: [folder]            ← TupleToUserset parent
+      define owner:  [user]
+      define editor: [user] or owner
+      define viewer: [user] or editor
+                 or folder.viewer        ← inherits viewer from parent folder
+
+  document.viewer resolves via 3 branches: direct, editor (which chains to owner), or tupleToUserset via the parent
+  folder. 500 users, 30 groups, 200 documents.
+
+  ---
+  4. check-deep-hierarchy.js / deep-hierarchy.json — 15-level chain (not used for the headline numbers)
+
+  type user
+  type org
+    relations
+      define member: [user]
+
+  type level_1
+    relations
+      define parent: [org]
+      define viewer: [user] or tupleToUserset(parent → member)
+
+  type level_2
+    relations
+      define parent: [level_1]
+      define viewer: [user] or tupleToUserset(parent → viewer)
+
+  ... repeated through level_15
+
+  Each level inherits viewer access from its parent via TupleToUserset. A check at level_15 requires 15 sequential
+  storage reads. Used to test depth limits, not headline throughput.
+
+  ---
+  Which Model Drove the Headline Numbers?
+
+  ┌────────────────────────┬─────────────────┬─────────────────────────────────────────────┐
+  │         Result         │    Scenario     │                    Model                    │
+  ├────────────────────────┼─────────────────┼─────────────────────────────────────────────┤
+  │ 1,919 req/s Check      │ check-direct.js │ Simple flat (no traversal, high cache hits) │
+  ├────────────────────────┼─────────────────┼─────────────────────────────────────────────┤
+  │ ~16,000 checks/s Batch │ batch-check.js  │ Same simple model with dedup                │
+  ├────────────────────────┼─────────────────┼─────────────────────────────────────────────┤
+  │ 459 req/s Write        │ write-tuples.js │ Simple model                                │
+  ├────────────────────────┼─────────────────┼─────────────────────────────────────────────┤
+  │ 176 req/s List-Objects │ list-objects.js │ Hierarchical model with 1,450 tuples        │
+  └────────────────────────┴─────────────────┴─────────────────────────────────────────────┘
+
+  The 1,919 req/s number — which drives the "4x faster than OpenFGA" claim — comes from the simplest possible model:
+  flat direct relations, no graph traversal, with a 96% in-process Moka cache hit rate. It is not measuring arbitrary
+  graph traversal performance.

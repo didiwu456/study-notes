@@ -1,0 +1,281 @@
+● The repo doesn't include OpenFGA's schema for direct comparison. I'll build the diff from RSFGA's actual code against OpenFGA's published MySQL schema (v1.x), which I know from OpenFGA's public repository.
+
+  ---
+  Side-by-Side Schema Comparison
+
+  Table Names
+
+  ┌─────────────────────┬──────────────────────┐
+  │       OpenFGA       │        RSFGA         │
+  ├─────────────────────┼──────────────────────┤
+  │ store               │ stores               │
+  ├─────────────────────┼──────────────────────┤
+  │ authorization_model │ authorization_models │
+  ├─────────────────────┼──────────────────────┤
+  │ tuple               │ tuples               │
+  ├─────────────────────┼──────────────────────┤
+  │ changelog           │ changelog (same)     │
+  └─────────────────────┴──────────────────────┘
+
+  ---
+  store → stores
+
+  OpenFGA:
+  CREATE TABLE store (
+    id           VARCHAR(26)   NOT NULL,
+    name         VARCHAR(256)  NOT NULL,
+    created_at   TIMESTAMP(6)  NOT NULL,
+    updated_at   TIMESTAMP(6)  NOT NULL,
+    deleted_at   TIMESTAMP(6)  NULL,        -- soft delete
+    PRIMARY KEY (id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+  RSFGA:
+  CREATE TABLE stores (
+    id         CHAR(26)      NOT NULL,
+    name       VARCHAR(256)  NOT NULL,
+    created_at TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    PRIMARY KEY (id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+  Differences:
+
+  ┌─────────────────────┬─────────────────────────────┬───────────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────┐
+  │       Column        │           OpenFGA           │               RSFGA               │                                      Impact                                       │
+  ├─────────────────────┼─────────────────────────────┼───────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ id type             │ VARCHAR(26)                 │ CHAR(26)                          │ No data loss, minor storage optimization                                          │
+  ├─────────────────────┼─────────────────────────────┼───────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ deleted_at          │ Present (soft delete)       │ Absent (hard delete with CASCADE) │ Must handle before migration — any soft-deleted stores must be purged or restored │
+  ├─────────────────────┼─────────────────────────────┼───────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ Timestamp precision │ TIMESTAMP(6) (microseconds) │ TIMESTAMP (seconds)               │ Sub-second precision lost on created_at/updated_at                                │
+  ├─────────────────────┼─────────────────────────────┼───────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ updated_at          │ Manual update required      │ Auto-updated via ON UPDATE        │ Behaviour change, not a data issue                                                │
+  ├─────────────────────┼─────────────────────────────┼───────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────┤
+  │ Collation           │ implicit                    │ utf8mb4_unicode_ci explicit       │ Verify your existing collation matches                                            │
+  └─────────────────────┴─────────────────────────────┴───────────────────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
+
+  ---
+  authorization_model → authorization_models
+
+  OpenFGA:
+  CREATE TABLE authorization_model (
+    store                  VARCHAR(26)   NOT NULL,
+    authorization_model_id VARCHAR(26)   NOT NULL,
+    schema_version         VARCHAR(50)   NOT NULL,
+    serialized_protobuf    MEDIUMBLOB    NOT NULL,   -- protobuf binary
+    created_at             TIMESTAMP(6)  NOT NULL,
+    PRIMARY KEY (store, authorization_model_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+  RSFGA:
+  CREATE TABLE authorization_models (
+    id             CHAR(26)      NOT NULL,
+    store_id       CHAR(26)      NOT NULL,
+    schema_version VARCHAR(50)   NOT NULL,
+    model_json     MEDIUMTEXT    NOT NULL,   -- JSON text
+    created_at     TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE,
+    INDEX idx_authorization_models_store (store_id, created_at, id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+  Differences:
+
+  ┌────────────────────────────────────┬───────────────────────────────────────────┬──────────────────────────────────────────────┬────────────────────────────────────────────────────────────────────┐
+  │                                    │                  OpenFGA                  │                    RSFGA                     │                               Impact                               │
+  ├────────────────────────────────────┼───────────────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Column store / store_id            │ store VARCHAR(26)                         │ store_id CHAR(26)                            │ Column rename                                                      │
+  ├────────────────────────────────────┼───────────────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Column authorization_model_id / id │ authorization_model_id                    │ id                                           │ Column rename                                                      │
+  ├────────────────────────────────────┼───────────────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Primary key                        │ Composite (store, authorization_model_id) │ Single id                                    │ Structural change                                                  │
+  ├────────────────────────────────────┼───────────────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Model storage                      │ serialized_protobuf MEDIUMBLOB            │ model_json MEDIUMTEXT                        │ Major — format change, requires deserialization + re-serialization │
+  ├────────────────────────────────────┼───────────────────────────────────────────┼──────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Foreign key                        │ None                                      │ FOREIGN KEY (store_id) REFERENCES stores(id) │ New constraint                                                     │
+  └────────────────────────────────────┴───────────────────────────────────────────┴──────────────────────────────────────────────┴────────────────────────────────────────────────────────────────────┘
+
+  The model storage format is the hardest migration step. OpenFGA serializes authorization models as protobuf binary blobs. RSFGA stores them as JSON. You cannot INSERT ... SELECT between these — each model
+  must be:
+  1. Read from OpenFGA (via its API or deserialized from protobuf)
+  2. Re-serialized to the JSON format RSFGA expects
+  3. Inserted into RSFGA
+
+  The easiest path is to re-POST each model via the RSFGA API rather than touching the DB directly.
+
+  ---
+  tuple → tuples
+
+  This is the biggest structural difference.
+
+  OpenFGA:
+  CREATE TABLE tuple (
+    store             VARCHAR(26)   NOT NULL,
+    object_type       VARCHAR(256)  NOT NULL,
+    object_id         VARCHAR(256)  NOT NULL,
+    relation          VARCHAR(50)   NOT NULL,
+    _user             VARCHAR(512)  NOT NULL,   -- "user:alice" or "group:eng#member"
+    condition_name    VARCHAR(256)  DEFAULT NULL,
+    condition_context MEDIUMBLOB    DEFAULT NULL,   -- protobuf binary
+    ulid              VARCHAR(26)   NOT NULL,
+    inserted_at       TIMESTAMP(6)  NOT NULL,
+    PRIMARY KEY (store, object_type, object_id, relation, _user, condition_name)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+  RSFGA:
+  CREATE TABLE tuples (
+    id                BIGINT AUTO_INCREMENT PRIMARY KEY,
+    store_id          CHAR(26)      NOT NULL,
+    object_type       VARCHAR(128)  NOT NULL,   -- reduced from 256
+    object_id         VARCHAR(256)  NOT NULL,
+    relation          VARCHAR(50)   NOT NULL,
+    user_type         VARCHAR(128)  NOT NULL,   -- split from _user
+    user_id           VARCHAR(128)  NOT NULL,   -- split from _user, reduced from 512
+    user_relation     VARCHAR(50)   DEFAULT NULL,  -- split from _user
+    user_relation_key VARCHAR(50)   AS (COALESCE(user_relation, '')) STORED,
+    condition_name    VARCHAR(256)  DEFAULT NULL,
+    condition_context JSON          DEFAULT NULL,   -- JSON, not protobuf
+    created_at        TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE,
+    UNIQUE INDEX idx_tuples_unique (store_id, object_type, object_id, relation, user_type, user_id, user_relation_key),
+    INDEX idx_tuples_object  (store_id, object_type, object_id),
+    INDEX idx_tuples_user    (store_id, user_type, user_id),
+    INDEX idx_tuples_relation (store_id, object_type, object_id, relation)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+  Differences:
+
+  ┌──────────────────────────┬────────────────────────────────────┬─────────────────────────────────────────────────────┬────────────────────────────────────────────────────┐
+  │                          │              OpenFGA               │                        RSFGA                        │                       Impact                       │
+  ├──────────────────────────┼────────────────────────────────────┼─────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ User storage             │ _user VARCHAR(512) — single string │ user_type + user_id + user_relation — three columns │ Major — requires parsing _user to split on : and # │
+  ├──────────────────────────┼────────────────────────────────────┼─────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ object_type size         │ VARCHAR(256)                       │ VARCHAR(128)                                        │ Data loss risk if any type names > 128 chars       │
+  ├──────────────────────────┼────────────────────────────────────┼─────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ user_id size             │ VARCHAR(512) via _user             │ VARCHAR(128)                                        │ Data loss risk if any user IDs > 128 chars         │
+  ├──────────────────────────┼────────────────────────────────────┼─────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ condition_context        │ MEDIUMBLOB (protobuf)              │ JSON                                                │ Requires deserialization + re-serialization        │
+  ├──────────────────────────┼────────────────────────────────────┼─────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ Primary key              │ Composite 6-column PK              │ BIGINT AUTO_INCREMENT                               │ Structural change                                  │
+  ├──────────────────────────┼────────────────────────────────────┼─────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ ulid column              │ Present (tuple's own ULID)         │ Absent                                              │ RSFGA uses auto-increment id instead               │
+  ├──────────────────────────┼────────────────────────────────────┼─────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ Column store / store_id  │ store                              │ store_id                                            │ Rename                                             │
+  ├──────────────────────────┼────────────────────────────────────┼─────────────────────────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ inserted_at / created_at │ inserted_at TIMESTAMP(6)           │ created_at TIMESTAMP                                │ Rename + precision loss                            │
+  └──────────────────────────┴────────────────────────────────────┴─────────────────────────────────────────────────────┴────────────────────────────────────────────────────┘
+
+  User field split example:
+
+  ┌──────────────────┬─────────────────┬───────────────┬─────────────────────────────────┐
+  │  OpenFGA _user   │ RSFGA user_type │ RSFGA user_id │       RSFGA user_relation       │
+  ├──────────────────┼─────────────────┼───────────────┼─────────────────────────────────┤
+  │ user:alice       │ user            │ alice         │ NULL                            │
+  ├──────────────────┼─────────────────┼───────────────┼─────────────────────────────────┤
+  │ group:eng#member │ group           │ eng           │ member                          │
+  ├──────────────────┼─────────────────┼───────────────┼─────────────────────────────────┤
+  │ *                │ ???             │ ???           │ ??? (wildcard handling differs) │
+  └──────────────────┴─────────────────┴───────────────┴─────────────────────────────────┘
+
+  The split logic: parse _user on the first : to get type and the rest; then parse the rest on # to separate id from relation.
+
+  ---
+  changelog
+
+  OpenFGA:
+  CREATE TABLE changelog (
+    store       VARCHAR(26)   NOT NULL,
+    object_type VARCHAR(256)  NOT NULL,
+    object_id   VARCHAR(256)  NOT NULL,
+    relation    VARCHAR(50)   NOT NULL,
+    _user       VARCHAR(512)  NOT NULL,
+    operation   INT           NOT NULL,   -- enum: 1=write, 2=delete
+    ulid        VARCHAR(26)   NOT NULL,
+    inserted_at TIMESTAMP(6)  NOT NULL,
+    PRIMARY KEY (store, ulid, object_type),
+    INDEX (store, object_type, inserted_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+  RSFGA:
+  CREATE TABLE changelog (
+    id                BIGINT AUTO_INCREMENT PRIMARY KEY,
+    store_id          CHAR(26)      NOT NULL,
+    object_type       VARCHAR(128)  NOT NULL,
+    object_id         VARCHAR(256)  NOT NULL,
+    relation          VARCHAR(50)   NOT NULL,
+    user_type         VARCHAR(128)  NOT NULL,
+    user_id           VARCHAR(128)  NOT NULL,
+    user_relation     VARCHAR(50)   DEFAULT NULL,
+    condition_name    VARCHAR(256)  DEFAULT NULL,
+    condition_context JSON          DEFAULT NULL,
+    operation         VARCHAR(50)   NOT NULL,   -- string: "write" or "delete"
+    timestamp         TIMESTAMP(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE,
+    INDEX idx_changelog_store_timestamp (store_id, timestamp, id),
+    INDEX idx_changelog_store_type      (store_id, object_type, timestamp, id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+  Same user-split requirement as tuples. Also: operation changes from INT to VARCHAR(50) ("write" / "delete").
+
+  ---
+  Complete Change Summary
+
+  ┌──────────────────────────┬────────────────────────────────────────────────┬───────────────────────────────────────────┐
+  │         Category         │                     Change                     │                   Risk                    │
+  ├──────────────────────────┼────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ Table names              │ All renamed (singular → plural)                │ Breaking                                  │
+  ├──────────────────────────┼────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ Column store             │ Renamed to store_id everywhere                 │ Breaking                                  │
+  ├──────────────────────────┼────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ Column _user             │ Split into user_type + user_id + user_relation │ High — requires data transformation       │
+  ├──────────────────────────┼────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ user_relation_key        │ New generated column                           │ New                                       │
+  ├──────────────────────────┼────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ authorization_model_id   │ Renamed to id                                  │ Breaking                                  │
+  ├──────────────────────────┼────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ Model storage format     │ Protobuf MEDIUMBLOB → JSON MEDIUMTEXT          │ High — requires re-serialization          │
+  ├──────────────────────────┼────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ Condition context format │ Protobuf MEDIUMBLOB → JSON                     │ High — requires re-serialization          │
+  ├──────────────────────────┼────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ ulid column on tuples    │ Removed                                        │ Moderate — if used for pagination cursors │
+  ├──────────────────────────┼────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ deleted_at on stores     │ Removed (no soft delete)                       │ Moderate — must purge soft-deleted rows   │
+  ├──────────────────────────┼────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ operation type           │ INT → VARCHAR(50)                              │ Low                                       │
+  ├──────────────────────────┼────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ object_type max length   │ 256 → 128                                      │ Data loss risk                            │
+  ├──────────────────────────┼────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ user_id max length       │ 512 → 128                                      │ Data loss risk                            │
+  ├──────────────────────────┼────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ Primary keys             │ Composite → auto-increment                     │ Structural                                │
+  ├──────────────────────────┼────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ Foreign key constraints  │ None → explicit CASCADE                        │ New constraint                            │
+  ├──────────────────────────┼────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ Auto-schema creation     │ None (manual SQL/migrations)                   │ RSFGA auto-creates on startup             │
+  └──────────────────────────┴────────────────────────────────────────────────┴───────────────────────────────────────────┘
+
+  ---
+  Recommended Migration Path
+
+  Because of the protobuf → JSON conversion and the _user column split, a direct INSERT ... SELECT is not possible. The cleanest approach is an API-level migration:
+
+  1. Stand up RSFGA with a fresh MySQL database
+     (RSFGA auto-creates its schema on first run)
+
+  2. For each store in OpenFGA:
+     a. POST /stores  (recreate)
+     b. POST /stores/{id}/authorization-models  (RSFGA accepts JSON directly)
+     c. POST /stores/{id}/write  (in batches of 100)
+
+  3. Verify with spot-check /check calls against both systems
+
+  4. Cut over traffic
+
+  If you must do a direct DB migration (e.g. hundreds of millions of tuples), a migration script needs to:
+  1. Deserialize OpenFGA protobuf models into JSON — requires the OpenFGA proto definitions
+  2. Parse every _user value: split on first :, then optionally on #
+  3. Deserialize condition contexts from protobuf to JSON
+  4. Check that no object_type, user_type, or user_id exceeds 128 chars — truncation is silent data corruption
+  5. Convert operation from 1/2 to "write"/"delete"
+  6. Handle any soft-deleted stores (rows with deleted_at IS NOT NULL) before importing

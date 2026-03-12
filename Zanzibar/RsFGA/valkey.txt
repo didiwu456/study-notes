@@ -1,0 +1,100 @@
+  ---
+  How Valkey Is Used as Cache
+
+  What Commands It Uses
+
+  All cache operations use standard Redis commands with no Valkey-specific extensions:
+
+  ┌────────────────────────────────┬──────────────────────────────────────────┬─────────────────────────────────┐
+  │           Operation            │                 Command                  │              Where              │
+  ├────────────────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤
+  │ Store a precomputed result     │ SET key value EX ttl                     │ cache.rs::set()                 │
+  ├────────────────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤
+  │ Read a precomputed result      │ GET key                                  │ cache.rs::get()                 │
+  ├────────────────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤
+  │ Record a cache miss (hot-path) │ ZADD key GT score member                 │ cache.rs::record_hotpath()      │
+  ├────────────────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤
+  │ Scan hot-path misses           │ ZSCAN key cursor MATCH pattern COUNT 100 │ cache.rs::scan_hotpath()        │
+  ├────────────────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤
+  │ Evict stale hot-path entries   │ ZREMBYSCORE key -inf cutoff              │ cache.rs::evict_stale_hotpath() │
+  ├────────────────────────────────┼──────────────────────────────────────────┼─────────────────────────────────┤
+  │ Invalidate a whole store       │ SCAN + DEL in batches                    │ cache.rs::invalidate_store()    │
+  └────────────────────────────────┴──────────────────────────────────────────┴─────────────────────────────────┘
+
+  Key Format
+
+  check:{store_id}:{model_id}:{object_type}:{encoded_object_id}#{relation}@{encoded_user}
+
+  Example:
+  check:store-01:model-abc:repo:torvalds%2Flinux#read@user:alice
+
+  #, @, and % in object IDs or user strings are percent-encoded to avoid delimiter collisions.
+
+  What Is Stored
+
+  Each key holds a JSON-serialised PrecomputedResult:
+  { "allowed": true, "computed_at": "2026-01-29T10:00:00Z" }
+
+  TTL is set at write time (SET EX 300 — default 5 minutes). There is no separate expiry update on reads.
+
+  The Hot-Path Registry
+
+  On a Valkey miss, the handler records the missed key into a Redis sorted set:
+  ZADD hotpath:{store_id} GT {unix_timestamp} "{object_type}:{object_id}#{relation}@{user}"
+
+  The score is the current timestamp. GT means only update if the new score is greater (i.e. only refresh on recent
+  activity). The precompute worker uses this sorted set to prioritise which checks to warm next.
+
+  ---
+  Can It Be Replaced With Redis?
+
+  Yes, transparently. The codebase is already wired to Redis under the hood.
+
+  The Dependency Is redis Crate, Not a Valkey Crate
+
+  From Cargo.toml:
+  redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+
+  This is the standard https://crates.io/crates/redis Rust crate, which targets Redis. Valkey is a Redis fork that
+  maintains full wire-protocol compatibility with Redis, so the same crate works against both.
+
+  The Connection URL Already Uses redis://
+
+  impl Default for ValkeyConfig {
+      fn default() -> Self {
+          Self {
+              url: "redis://localhost:6379".to_string(),   // ← redis:// scheme
+              ...
+          }
+      }
+  }
+
+  The Error Type Wraps redis::RedisError
+
+  pub enum ValkeyError {
+      #[error("Valkey connection error: {0}")]
+      Connection(#[from] redis::RedisError),   // ← Redis error type
+      ...
+  }
+
+  Summary
+
+  ┌──────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────┐
+  │                              │                                      Detail                                      │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Underlying crate             │ redis v0.27 (the Redis Rust crate)                                               │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Connection                   │ redis::aio::ConnectionManager                                                    │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Commands used                │ GET, SET EX, ZADD GT, ZSCAN, ZREMBYSCORE, SCAN, DEL — all standard Redis         │
+  │                              │ commands                                                                         │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Valkey-specific features     │ None                                                                             │
+  │ used                         │                                                                                  │
+  ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Protocol                     │ RESP2/RESP3, identical between Redis and Valkey                                  │
+  └──────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────┘
+
+  To switch from Valkey to Redis, change the URL (redis:// already works) and point it at a Redis instance. No code
+  changes needed — the crate, the commands, and the wire protocol are identical. The crate is named rsfga-valkey and the
+   config struct is ValkeyConfig purely as a naming convention, not because anything Valkey-specific is used.

@@ -1,0 +1,354 @@
+ ---
+  Scenario
+
+  Authorization model for a document system:
+  type user
+  type group
+    relations
+      define member: [user]
+  type document
+    relations
+      define owner:  [user]
+      define editor: [user] or owner
+      define viewer: [user] or editor
+
+  Stored tuples:
+  (group:eng#member, member,  group:eng)   ← alice is a member of group:eng
+  (group:eng,        editor,  document:readme)  ← group:eng is an editor
+  (No direct (user:alice, viewer, document:readme) tuple exists.)
+
+  Request: Does user:alice have viewer access to document:readme?
+
+  POST /stores/store-01/check
+  {
+    "tuple_key": {
+      "user":     "user:alice",
+      "relation": "viewer",
+      "object":   "document:readme"
+    }
+  }
+
+  ---
+  Phase 1 — HTTP Layer (routes.rs::check())
+
+  Step 1 — Input validation
+  - Check user, relation, object are all non-empty → pass.
+
+  Step 2 — RYOW consistency check (wait_for_consistency)
+  - No X-Consistency header, no consistency.write_ticket in body.
+  - NATS feature may be compiled in, but no write ticket → skip entirely. No blocking.
+
+  Step 3 — authorization_model_id
+  - Not specified in request → skip the DB fetch to validate it. The resolver will use the latest model.
+
+  Step 4 — Contextual tuple validation
+  - No contextual_tuples in body → empty Vec.
+
+  Step 5 — Domain request construction
+  DomainCheckRequest {
+      store_id:                "store-01",
+      user:                    "user:alice",
+      relation:                "viewer",
+      object:                  "document:readme",
+      contextual_tuples:       [],       // empty Arc<Vec>
+      context:                 {},       // empty HashMap (no CEL variables)
+      authorization_model_id:  None,
+  }
+
+  ---
+  Phase 2 — Valkey (Precomputed Cache) Lookup
+
+  Only runs if the precompute feature is compiled in and state.precompute_cache is Some.
+
+  Step 6 — Bypass check
+  - contextual_tuples is empty ✓
+  - context is empty ✓
+  - → Proceed to Valkey lookup.
+
+  Step 7 — Resolve model_id for cache key
+  - authorization_model_id is None → query DB for latest model:
+  SELECT id FROM authorization_models
+  WHERE store_id = 'store-01'
+  ORDER BY created_at DESC LIMIT 1
+  - → returns model-abc123
+
+  Step 8 — Build Valkey key
+  check:store-01:model-abc123:document:readme#viewer@user:alice
+
+  Step 9 — Valkey GET
+  GET check:store-01:model-abc123:document:readme#viewer@user:alice
+  → nil (cache miss — this check hasn't been precomputed yet)
+
+  Step 10 — Record hot-path miss (fire-and-forget)
+  ZADD hotpath:store-01 GT <unix_timestamp> "document:readme#viewer@user:alice"
+  This registers the key as "frequently missed" so the precompute worker will eventually warm it.
+
+  ---
+  Phase 3 — GraphResolver Entry (graph_resolver.rs::check())
+
+  Step 11 — Input validation
+  - user:alice — valid type:id format, not a wildcard.
+  - document:readme — valid type:id format.
+  - viewer — non-empty.
+  - → pass.
+
+  Step 12 — Store existence check (DB)
+  SELECT id FROM stores WHERE id = 'store-01'
+  → found.
+
+  Step 13 — authorization_model_id is None → skip secondary validation.
+
+  Step 14 — Cache bypass decision (in-process Moka)
+  - contextual_tuples.is_empty() = true ✓
+  - context.is_empty() = true ✓
+  - authorization_model_id.is_none() = true ✓
+  - → caching is eligible. Build CacheKey:
+  CacheKey { store_id: "store-01", object: "document:readme",
+              relation: "viewer", user: "user:alice" }
+
+  Step 15 — Moka cache GET (10ms timeout)
+  cache.get(&CacheKey { ... }).await  // → None (cold)
+  → miss → cache_metrics.misses += 1
+
+  Step 16 — Spawn graph traversal (wrapped in 30s timeout)
+
+  ---
+  Phase 4 — resolve_check() — First Call
+
+  TraversalContext: { depth: 0, visited: {} }
+
+  Step 17 — Depth check: 0 < 25 ✓
+
+  Step 18 — Cycle detection key:
+  "store-01:document:readme#viewer"
+  Not in visited → continue.
+
+  Step 19 — Parse object: "document:readme" → type="document", id="readme"
+
+  Step 20 — Fetch relation definition (DB / model cache)
+  SELECT rewrite, type_constraints
+  FROM relation_definitions
+  WHERE store_id = 'store-01'
+    AND authorization_model_id = 'model-abc123'
+    AND object_type = 'document'
+    AND relation = 'viewer'
+  Returns:
+  rewrite = Union([This, ComputedUserset { relation: "editor" }])
+  type_constraints = [TypeConstraint { type: "user" }]
+  (viewer = [user] or editor)
+
+  Step 21 — Add to visited: visited = { "store-01:document:readme#viewer" }
+
+  Step 22 — Dispatch to resolve_userset(Union { ... })
+
+  ---
+  Phase 5 — resolve_union()
+
+  Step 23 — Spawn two parallel futures via FuturesUnordered:
+
+  ┌────────┬────────────────────────────────────────┐
+  │ Branch │                Userset                 │
+  ├────────┼────────────────────────────────────────┤
+  │ A      │ This (direct [user] lookup)            │
+  ├────────┼────────────────────────────────────────┤
+  │ B      │ ComputedUserset { relation: "editor" } │
+  └────────┴────────────────────────────────────────┘
+
+  Both start running concurrently. Results arrive in completion order.
+
+  ---
+  Branch A — resolve_direct() for viewer on document:readme
+
+  Step 24 — Contextual tuple scan: empty list → skip.
+
+  Step 25 — DB read:
+  SELECT user_type, user_id, user_relation, condition_name, condition_context
+  FROM tuples
+  WHERE store_id    = 'store-01'
+    AND object_type = 'document'
+    AND object_id   = 'readme'
+    AND relation    = 'viewer'
+  → 0 rows (no direct viewer tuples)
+
+  → Branch A returns allowed: false.
+
+  ---
+  Branch B — ComputedUserset → resolve_check() recursion
+
+  The resolver constructs a new request: same user/object, relation changed to editor.
+
+  Step 26 — New resolve_check() call
+  - Depth: 1 (incremented)
+  - Cycle key: "store-01:document:readme#editor" — not in visited ✓
+  - visited = { "store-01:document:readme#viewer", "store-01:document:readme#editor" }
+
+  Step 27 — Fetch relation definition for editor
+  ... WHERE relation = 'editor'
+  Returns:
+  rewrite = Union([This, ComputedUserset { relation: "owner" }])
+  type_constraints = [TypeConstraint { type: "user" }]
+  (editor = [user] or owner)
+
+  Step 28 — resolve_union() — two more parallel branches:
+
+  ┌────────┬────────────────────────────────────────┐
+  │ Branch │                Userset                 │
+  ├────────┼────────────────────────────────────────┤
+  │ C      │ This (direct [user] lookup for editor) │
+  ├────────┼────────────────────────────────────────┤
+  │ D      │ ComputedUserset { relation: "owner" }  │
+  └────────┴────────────────────────────────────────┘
+
+  ---
+  Branch C — resolve_direct() for editor on document:readme
+
+  Step 29 — DB read:
+  ... WHERE relation = 'editor'
+  → 1 row: (user_type="group", user_id="eng", user_relation="member")
+
+  This is a userset reference (group:eng#member), not a direct user:alice match.
+
+  Step 30 — user_matches check: "user:alice" == "group:eng" → false.
+
+  Step 31 — Userset reference detected (user_relation = Some("member")) → recurse:
+
+  New request: does user:alice have member relation to group:eng?
+  - Depth: 2
+  - Cycle key: "store-01:group:eng#member" — not in visited ✓
+
+  Step 32 — Fetch relation definition for member on group
+  ... WHERE object_type = 'group' AND relation = 'member'
+  Returns:
+  rewrite = This
+  type_constraints = [TypeConstraint { type: "user" }]
+
+  Step 33 — resolve_direct() for member on group:eng
+
+  Step 34 — DB read:
+  ... WHERE object_type='group' AND object_id='eng' AND relation='member'
+  → 1 row: (user_type="user", user_id="alice", user_relation=None)
+
+  Step 35 — Type constraint check: tuple type "user" matches constraint [user] ✓
+
+  Step 36 — user_matches: "user:alice" == "user:alice" → true ✓
+
+  Step 37 — Condition evaluation: condition_name = None → skip → condition_ok = true
+
+  → Returns allowed: true up the call stack.
+
+  Back in Branch C: the userset check returned true. The tuple (group:eng#member, editor, document:readme) has no
+  condition → condition_ok = true.
+
+  → Branch C returns allowed: true
+
+  ---
+  Phase 6 — Short-Circuit Propagation
+
+  Step 38 — Union in editor resolve_union() receives Branch C's allowed: true → short-circuits. Branch D (owner check)
+  is dropped.
+
+  → editor check returns allowed: true
+
+  Step 39 — Back in the outer viewer resolve_union(): Branch B (ComputedUserset{editor}) returns allowed: true →
+  short-circuits. Branch A already returned false but that doesn't matter.
+
+  → viewer check returns allowed: true
+
+  ---
+  Phase 7 — Cache Population
+
+  Step 40 — Moka cache INSERT (10ms timeout, best-effort)
+  cache.insert(
+      CacheKey { store_id: "store-01", object: "document:readme",
+                  relation: "viewer", user: "user:alice" },
+      true
+  ).await
+  Also updates secondary indices:
+  - by_store["store-01"] → { key } (for O(K) store-level invalidation)
+  - by_object[("store-01", "document:readme")] → { key } (for object-level invalidation)
+
+  TTL: 10 seconds. After expiry, next request re-traverses.
+
+  ---
+  Phase 8 — HTTP Response
+
+  Step 41 — Return to HTTP handler:
+  HTTP 200 OK
+  {
+    "allowed": true
+  }
+
+  ---
+  Full Call Stack Summary
+
+  POST /stores/store-01/check
+    │
+    ├─ [Validation] user/relation/object non-empty
+    ├─ [RYOW] no write ticket → skip
+    ├─ [Valkey] GET check:store-01:model-abc123:document:readme#viewer@user:alice
+    │            → MISS → ZADD hotpath:store-01 (fire & forget)
+    │
+    └─ GraphResolver::check()
+         ├─ [Moka] GET CacheKey{...viewer...} → MISS
+         │
+         └─ resolve_check(viewer, depth=0)
+              ├─ DB: fetch relation def for document.viewer
+              │       → Union([This, ComputedUserset{editor}])
+              │
+              └─ resolve_union() [parallel]
+                   ├─ Branch A: resolve_direct(viewer)
+                   │    └─ DB: read tuples(document, readme, viewer) → 0 rows → false
+                   │
+                   └─ Branch B: resolve_check(editor, depth=1)
+                        ├─ DB: fetch relation def for document.editor
+                        │       → Union([This, ComputedUserset{owner}])
+                        │
+                        └─ resolve_union() [parallel]
+                             ├─ Branch C: resolve_direct(editor)
+                             │    ├─ DB: read tuples(document, readme, editor)
+                             │    │       → 1 row: group:eng#member
+                             │    │
+                             │    └─ resolve_check(member on group:eng, depth=2)
+                             │         ├─ DB: fetch relation def for group.member → This
+                             │         └─ resolve_direct(member)
+                             │              ├─ DB: read tuples(group, eng, member)
+                             │              │       → 1 row: user:alice
+                             │              ├─ user_matches("user:alice", "user:alice") → true ✓
+                             │              └─ no condition → allowed: TRUE ✓
+                             │
+                             └─ [short-circuit] Branch C=true → drop Branch D (owner)
+                                  → editor: TRUE ✓
+                   │
+                   └─ [short-circuit] Branch B=true → viewer: TRUE ✓
+         │
+         ├─ [Moka] INSERT CacheKey{...viewer...} = true (TTL 10s)
+         └─ CheckResult { allowed: true }
+    │
+    └─ HTTP 200 { "allowed": true }
+
+  ---
+  What Changes on the Second Identical Request
+
+  POST /stores/store-01/check  (same payload, within 10 seconds)
+    │
+    ├─ [Valkey] → MISS again (precompute worker hasn't run yet)
+    │
+    └─ GraphResolver::check()
+         └─ [Moka] GET CacheKey{...viewer...} → HIT → allowed: true
+                    (returns immediately, zero DB queries)
+
+  Once the precompute worker processes the hot-path registry, Valkey gets warmed and subsequent requests short-circuit
+  even before reaching GraphResolver.
+
+  ---
+  What the NATS Write Tracker Does to Subsequent Checks
+
+  If someone deletes the tuple (group:eng#member, editor, document:readme) using the async write path:
+
+  1. Write published to NATS JetStream (rsfga.writes.store-01)
+  2. Storage consumer commits the delete to DB, publishes CommittedEvent
+  3. CommittedEvent triggers cache invalidation:
+    - Moka: invalidates all keys for (store-01, document:readme) via by_object secondary index — O(K) not O(N)
+    - Valkey: precompute worker recomputes affected tuples and updates/evicts the key
+  4. If a client passed a write_ticket in the next check request, wait_for_consistency() blocks until the CommittedEvent
+   sequence matches — guaranteeing the read sees the write.

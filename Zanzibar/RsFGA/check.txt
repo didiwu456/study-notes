@@ -1,0 +1,93 @@
+  ---
+  /check API — Full Logic
+
+  Entry Point: check() (lines 154–242)
+
+  check(request)
+    1. Validate inputs (user/object format, non-empty relation)
+    2. Verify store exists
+    3. If authorization_model_id specified, verify that model version exists
+    4. Decide whether to use cache:
+       - SKIP cache if: contextual tuples present, CEL context non-empty, or model_id pinned
+       - Otherwise: build a CacheKey(store_id, object, relation, user)
+    5. Cache lookup (with 10ms timeout — never blocks):
+       - HIT  → return immediately
+       - MISS → fall through to graph traversal
+    6. Wrap graph traversal in configurable timeout (default 30s)
+    7. On success: write result to cache (best-effort, 10ms timeout)
+
+  ---
+  Graph Traversal: resolve_check() (lines 504–558)
+
+  resolve_check(request, ctx)
+    1. Depth limit check (max 25 — matches OpenFGA, prevents DoS)
+    2. Cycle detection: build key "store_id:object#relation"
+       - If already in ctx.visited → error CycleDetected
+       - Otherwise add to visited set (Arc<HashSet> — cheap to clone)
+    3. Parse "type:id" from object string
+    4. Fetch relation definition from model
+       (uses pinned model_id if provided, else latest)
+    5. Dispatch to resolve_userset() based on the rewrite rule
+
+  ---
+  Rewrite Rule Dispatch: resolve_userset()
+
+  ┌─────────────────┬───────────────────────────────────────────────────────────┐
+  │      Rule       │                           Logic                           │
+  ├─────────────────┼───────────────────────────────────────────────────────────┤
+  │ This            │ Direct tuple lookup → resolve_direct()                    │
+  ├─────────────────┼───────────────────────────────────────────────────────────┤
+  │ ComputedUserset │ Same object, different relation → recurse resolve_check() │
+  ├─────────────────┼───────────────────────────────────────────────────────────┤
+  │ TupleToUserset  │ Find parent objects via tupleset → recurse on each parent │
+  ├─────────────────┼───────────────────────────────────────────────────────────┤
+  │ Union           │ All children in parallel → short-circuit on first true    │
+  ├─────────────────┼───────────────────────────────────────────────────────────┤
+  │ Intersection    │ All children in parallel → short-circuit on first false   │
+  ├─────────────────┼───────────────────────────────────────────────────────────┤
+  │ Exclusion       │ Both in parallel → base.allowed && !subtract.allowed      │
+  └─────────────────┴───────────────────────────────────────────────────────────┘
+
+  ---
+  Direct Tuple Lookup: resolve_direct() (lines 657–815)
+
+  This is the leaf node — where actual data is read:
+
+  resolve_direct()
+    1. Check contextual tuples (request-scoped, in-memory):
+       - For each matching (object, relation) tuple:
+         a. Validate type constraints (security: reject disallowed types)
+         b. Direct match (user:alice == user:alice) → evaluate CEL condition
+         c. Userset reference (group:eng#member) → recurse to check membership
+
+    2. Read stored tuples from database:
+       - For each tuple:
+         a. Validate type constraints
+         b. Direct match → evaluate CEL condition
+         c. Userset reference → recurse to check membership
+
+    3. A tuple grants access only if:
+       - User matches (exact or wildcard type:*) AND
+       - CEL condition evaluates to true (or no condition present)
+
+    4. If nothing matches → return allowed: false
+
+  ---
+  Key Security Rules
+
+  - Wildcards: user:* in a stored tuple grants all users of that type. But a requesting user can never be user:* — that
+  would be a bypass attack.
+  - Type constraints: Every tuple's user type is validated against the relation's allowed types. A bot:scraper cannot
+  match a relation that only allows user or group#member.
+  - Conditions (CEL): A matching tuple is only granted if its CEL expression evaluates true against the merged context.
+  A false condition means "continue checking other tuples", not "deny immediately".
+
+  ---
+  Union/Intersection Error Handling (nuanced)
+
+  - Union: CycleDetected/DepthLimitExceeded on a branch = treat as false (that path just couldn't find access). Only
+  propagate if all branches hit path-termination errors.
+  - Intersection: Any error (including cycle) = propagate immediately (if one branch can't be evaluated, the
+  intersection can't be confirmed).
+  - Exclusion: Both branches run in parallel. Short-circuit rules: if base=false, result is false regardless; if
+  subtract=true, result is false regardless. Only propagate errors when the errored branch's result is actually needed.

@@ -1,0 +1,87 @@
+  ---
+  RSFGA — What It Is
+
+  A high-performance Rust implementation of OpenFGA — a fine-grained authorization engine (like Google Zanzibar). It is
+  a drop-in replacement for OpenFGA with identical REST/gRPC APIs, built across three phases.
+
+  ---
+  Core Logic: The Graph Resolver
+
+  The heart of the system is in rsfga-domain/src/resolver/. Authorization is modeled as a graph traversal problem:
+
+  - A tuple is a fact: (user, relation, object) — e.g., "alice is a viewer of document:X"
+  - An authorization model defines relation hierarchies using rewrite rules
+  - A check asks: "does this user have this relation to this object?"
+
+  The resolver walks the relation graph recursively:
+
+  ┌─────────────────┬─────────────────────────────────────────────────────────────────┐
+  │  Rewrite Rule   │                              Logic                              │
+  ├─────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ This            │ Direct tuple lookup in storage                                  │
+  ├─────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ ComputedUserset │ Recurse on same object, different relation                      │
+  ├─────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ TupleToUserset  │ Find parent objects via a relation, then check on those parents │
+  ├─────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ Union           │ Parallel async futures — short-circuit on first true            │
+  ├─────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ Intersection    │ All parallel branches must be true                              │
+  ├─────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ Exclusion       │ Base is true AND subtract is false                              │
+  └─────────────────┴─────────────────────────────────────────────────────────────────┘
+
+  Safety mechanisms: depth limit of 25, cycle detection via a visited-nodes set, configurable 30s timeout, and CEL
+  (Common Expression Language) for attribute-based conditions on tuples.
+
+  ---
+  Three-Tier Cache Architecture
+
+  1. In-process Moka cache (rsfga-domain) — TTL-based, ~10s, 100K entries. Bypassed when contextual tuples or CEL
+  context are present.
+  2. Valkey/Redis precomputed cache (Phase 3, rsfga-valkey) — sub-millisecond hits. Populated proactively by a worker
+  daemon after each write event.
+  3. Singleflight in the batch handler — prevents duplicate concurrent executions of the same check.
+
+  ---
+  Storage Layer
+
+  A DataStore trait abstracts all persistence. Implementations:
+  - PostgreSQL and MySQL (via SQLx, async)
+  - CockroachDB (detected at runtime via PostgreSQL driver)
+  - RocksDB (embedded, for edge nodes)
+  - In-memory (tests only)
+
+  Key operations: write_tuples, read_tuples, get_objects_for_user (reverse lookups for ListObjects), paginated reads.
+
+  ---
+  API Layer
+
+  - REST via Axum — all OpenFGA endpoints (/check, /batch_check, /expand, /list_objects, /list_users, write/read/model
+  management)
+  - gRPC via Tonic — same operations over protobuf
+  - Batch Check does two-stage deduplication: intra-batch key dedup, then singleflight across concurrent requests
+
+  ---
+  Phase 2: NATS Async Writes
+
+  Writes can go to NATS JetStream instead of the database, returning immediately to the client. A consumer daemon
+  batches and commits them to the DB, then publishes CommittedEvents that drive cache invalidation and edge sync. A RYOW
+   (Read-Your-Own-Writes) ticket lets clients wait for consistency when needed.
+
+  ---
+  Phase 3: Precomputed Cache
+
+  When a CommittedEvent arrives, a classifier determines which (user, relation, object) triples are affected. Workers
+  re-run those checks and write results to Valkey. Subsequent checks hit Valkey first (sub-millisecond) before falling
+  through to the graph resolver.
+
+  ---
+  Key Design Choices
+
+  - Async-first (Tokio) — parallelism in union/intersection traversal
+  - Lock-free concurrency (DashMap instead of Mutex<HashMap>)
+  - Newtype pattern throughout for compile-time validated types
+  - CEL conditions on tuples enable ABAC (attribute-based access control)
+  - Correctness is non-negotiable — depth limits, cycle detection, and type constraints are mandatory, never skipped for
+   performance

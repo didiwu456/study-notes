@@ -1,0 +1,262 @@
+  ---
+  Scenario: GitHub-Style Repository Permissions
+
+  Authorization Model
+
+  type user
+
+  type team
+    relations
+      define member: [user]
+
+  type org
+    relations
+      define member: [user, team#member]
+
+  type repo
+    relations
+      define admin:    [user, team#member, org#member]
+      define maintain: [user, team#member, org#member] or admin
+      define write:    [user, team#member, org#member] or maintain
+      define read:     [user, team#member, org#member] or write
+
+  Stored Tuples for repo:torvalds/linux
+
+  ┌──────────┬───────────────────────────────────────────────────────────────────────────────────────┬──────────────┐
+  │ Relation │                                         Tuple                                         │    Count     │
+  ├──────────┼───────────────────────────────────────────────────────────────────────────────────────┼──────────────┤
+  │ read     │ user:torvalds, user:gregkh                                                            │ 2 direct     │
+  │          │                                                                                       │ users        │
+  ├──────────┼───────────────────────────────────────────────────────────────────────────────────────┼──────────────┤
+  │ read     │ team:subsys-net#member, team:subsys-mm#member, ..., team:contributors-2024#member     │ 600 teams    │
+  │          │ (pos 587), ...                                                                        │              │
+  ├──────────┼───────────────────────────────────────────────────────────────────────────────────────┼──────────────┤
+  │ read     │ org:linux-foundation#member, org:redhat#member, ...                                   │ 400 orgs     │
+  ├──────────┼───────────────────────────────────────────────────────────────────────────────────────┼──────────────┤
+  │ write    │ 2 direct + 200 teams + 100 orgs                                                       │ 302          │
+  ├──────────┼───────────────────────────────────────────────────────────────────────────────────────┼──────────────┤
+  │ maintain │ 2 direct + 30 teams + 20 orgs                                                         │ 52           │
+  ├──────────┼───────────────────────────────────────────────────────────────────────────────────────┼──────────────┤
+  │ admin    │ 2 direct + 7 teams + 3 orgs                                                           │ 12           │
+  └──────────┴───────────────────────────────────────────────────────────────────────────────────────┴──────────────┘
+
+  Total read tuples: 1,002
+
+  Alice is a member of team:contributors-2024, which is the 587th entry in the read tuple list. She has no
+  write/maintain/admin access.
+
+  Request
+
+  POST /stores/store-01/check
+  {
+    "tuple_key": {
+      "user":     "user:alice",
+      "relation": "read",
+      "object":   "repo:torvalds/linux"
+    }
+  }
+
+  ---
+  The Two Critical Behaviors in the Code
+
+  Before tracing, these two facts from the source completely determine the query count:
+
+  1. resolve_union() → FuturesUnordered — union branches fire concurrently. All children start immediately and the first
+   true short-circuits the rest.
+  2. resolve_direct() → for tuple in tuples { ... .await? } — the loop inside each This branch is strictly sequential.
+  Each userset reference is fully resolved before the next tuple is examined.
+
+  This means: within a single This branch, you pay one DB round-trip per userset in order. Across union branches,
+  everything runs at the same time.
+
+  ---
+  Full Traversal Trace
+
+  resolve_check("user:alice", "read", "repo:torvalds/linux", depth=0)
+
+  Step 1 — Fetch relation definition for repo.read
+
+  DB query #1 (or model cache hit):
+  SELECT rewrite FROM relation_definitions
+  WHERE store_id='store-01' AND object_type='repo' AND relation='read'
+  → Union([This, ComputedUserset{write}])
+
+  Step 2 — resolve_union() fires 2 branches concurrently
+
+  FuturesUnordered {
+      Branch A: resolve_userset(This,              ...)   ← resolve_direct(read)
+      Branch B: resolve_userset(ComputedUserset{write}, ...)
+  }
+
+  Both branches are scheduled on Tokio immediately. They interleave at every .await point. What follows is concurrent,
+  not sequential.
+
+  ---
+  Branch A — resolve_direct(read) [runs concurrently with Branch B]
+
+  DB query #2:
+  SELECT user_type, user_id, user_relation
+  FROM tuples
+  WHERE store_id='store-01'
+    AND object_type='repo' AND object_id='torvalds/linux'
+    AND relation='read'
+  → 1,002 rows returned in one query.
+
+  Now the sequential for loop begins:
+
+  for tuple in 1002 rows:                          ← sequential, one at a time
+
+    row 1:  user:torvalds       → user_matches("user:alice", "user:torvalds") → false
+                                   no user_relation → skip (0 extra queries)
+
+    row 2:  user:gregkh         → false, skip
+
+    row 3:  team:subsys-net     (user_relation = "member")
+      → DB query #3:
+        SELECT ... WHERE object_type='team' AND object_id='subsys-net' AND relation='member'
+        → [user:linus, user:davem, ...]  alice not here → false → continue loop
+
+    row 4:  team:subsys-mm      (user_relation = "member")
+      → DB query #4: member of subsys-mm → alice not here → false
+
+    row 5:  team:subsys-fs      → DB query #5  → false
+    row 6:  team:subsys-block   → DB query #6  → false
+    ...
+    row 100: team:maintainers-stable → DB query #100 → false
+    ...
+    row 400: org:linux-foundation  (user_relation = "member")
+      → DB query #400:
+        SELECT ... WHERE object_type='org' AND object_id='linux-foundation' AND relation='member'
+        → alice not here → false
+    ...
+    row 588: team:contributors-2024  (user_relation = "member")
+      → DB query #588:
+        SELECT ... WHERE object_type='team' AND object_id='contributors-2024' AND relation='member'
+        → [user:alice, user:bob, ...]   ← alice found!
+        → return allowed: true  ← BRANCH A SHORT-CIRCUITS
+
+  Branch A fires 588 DB queries total (1 for the read tuple list + 587 for membership lookups).
+
+  ---
+  Branch B — resolve_check(write, depth=1) [runs concurrently with Branch A]
+
+  DB query B1 (relation def for repo.write):
+  → Union([This, ComputedUserset{maintain}])
+
+  Fires 2 more sub-branches concurrently:
+
+  Branch B1 — resolve_direct(write)
+
+  DB query B2:
+  SELECT ... WHERE relation='write' AND object_id='torvalds/linux'
+  → 302 rows
+
+  Sequential for loop:
+  row 1-2:   user:torvalds, user:gregkh → false
+  row 3:     team:core-maintainers#member → DB query B3 → alice not here → false
+  row 4:     team:release-team#member    → DB query B4 → false
+  ...
+  row 302:   org:redhat#member           → DB query B203 → false
+  → exhausted all 302 tuples → allowed: false
+
+  Branch B1 fires 1 + 200 + 100 = 301 DB queries (all returning false).
+
+  Branch B2 — resolve_check(maintain, depth=2) [parallel with B1]
+
+  DB query B-m1 (relation def for repo.maintain):
+  → Union([This, ComputedUserset{admin}])
+
+  Fires 2 sub-branches concurrently:
+
+  Branch B2a — resolve_direct(maintain)
+
+  DB query B-m2: tuples for maintain → 52 rows
+  Sequential loop over 52 rows:
+    2 direct users → false
+    30 teams → DB queries B-m3 through B-m32 → all false
+    20 orgs  → DB queries B-m33 through B-m52 → all false
+  → false
+  Branch B2a fires 1 + 30 + 20 = 51 DB queries.
+
+  Branch B2b — resolve_check(admin, depth=3) [parallel with B2a]
+
+  DB query B-a1 (relation def for repo.admin):
+  → Union([This]) (no ComputedUserset, it's the root)
+
+  Branch B2b1 — resolve_direct(admin)
+
+  DB query B-a2: tuples for admin → 12 rows
+  Sequential loop:
+    2 direct users → false
+    7 teams → DB queries B-a3 through B-a9 → false
+    3 orgs  → DB queries B-a10 through B-a12 → false
+  → false
+  Branch B2b1 fires 1 + 7 + 3 = 11 DB queries.
+
+  ---
+  Query Count Summary
+
+  ┌──────────────────────┬──────────────────────────────────────────────────────────────────────┬──────────┐
+  │        Branch        │                                 What                                 │ Queries  │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────┼──────────┤
+  │ A — This(read)       │ 1 read-tuple fetch + 587 membership lookups (stops when alice found) │ 588      │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────┼──────────┤
+  │ B1 — This(write)     │ 1 write-tuple fetch + 200 team + 100 org checks                      │ 301      │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────┼──────────┤
+  │ B2a — This(maintain) │ 1 maintain-tuple fetch + 30 team + 20 org checks                     │ 51       │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────┼──────────┤
+  │ B2b1 — This(admin)   │ 1 admin-tuple fetch + 7 team + 3 org checks                          │ 11       │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────┼──────────┤
+  │ Relation def lookups │ read, write, maintain, admin (usually model-cached)                  │ 0–4      │
+  ├──────────────────────┼──────────────────────────────────────────────────────────────────────┼──────────┤
+  │ Total                │                                                                      │ ~951–955 │
+  └──────────────────────┴──────────────────────────────────────────────────────────────────────┴──────────┘
+
+  All of Branch B's work (~363 queries) completes while Branch A is still scanning through teams 1–587. By the time
+  Branch A hits team #587, Branch B has long finished and returned false.
+
+  The outer union sees:
+  - Branch B completed → false
+  - Branch A completed → true
+  → short-circuits → returns allowed: true
+
+  ---
+  The Fundamental Cost Formula
+
+  Total DB queries ≈  1                             (fetch object's relation tuples)
+                    + N_direct_before_alice          (sequential membership lookups until found)
+                    + Σ(all parallel branch costs)   (run concurrently, may complete early)
+
+  For this example:
+  - N_direct_before_alice = 587 (alice's position in the read list)
+  - Parallel branch work = 363 (all complete before Branch A finishes)
+
+  How position affects query count
+
+  ┌─────────────────────────────────┬──────────────────┬───────┐
+  │        Alice's position         │ Branch A queries │ Total │
+  ├─────────────────────────────────┼──────────────────┼───────┤
+  │ 1st team (best case)            │ 2                │ ~370  │
+  ├─────────────────────────────────┼──────────────────┼───────┤
+  │ 300th team                      │ 300              │ ~665  │
+  ├─────────────────────────────────┼──────────────────┼───────┤
+  │ 587th team (our scenario)       │ 588              │ ~951  │
+  ├─────────────────────────────────┼──────────────────┼───────┤
+  │ Last org, position 1002 (worst) │ 1002             │ ~1365 │
+  ├─────────────────────────────────┼──────────────────┼───────┤
+  │ Not found anywhere (deny)       │ 1002             │ ~1365 │
+  └─────────────────────────────────┴──────────────────┴───────┘
+
+  The worst case (alice not found) fires all 1,002 membership lookups in Branch A plus all parallel branch work —
+  roughly 1,365 DB queries for a single /check returning false.
+
+  ---
+  Key Insight: Why This Is Expensive
+
+  The expensive part is entirely in resolve_direct's sequential for loop (lines 740–811). Each team:X#member tuple in
+  the read list adds one DB round-trip, and they cannot be parallelised — the code literally awaits each one before
+  checking the next. The union-level parallelism helps at the relation level (read vs write vs maintain vs admin all run
+   concurrently) but does nothing for the within-relation userset fan-out.
+
+  This is why the precomputed cache matters so much at this scale: a Valkey GET costs ~0.1ms and bypasses all 951
+  queries entirely.

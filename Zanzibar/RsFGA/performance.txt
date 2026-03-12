@@ -1,0 +1,65 @@
+  ---
+  The OpenFGA Baselines: Cited, Not Re-Measured
+
+  There is no head-to-head test in this repo. The OpenFGA baseline numbers (483 req/s, 23 checks/s, etc.) appear in the
+  docs as pre-existing reference points — they were written into the design documents at project inception as targets to
+   beat. The codebase contains no code that actually ran OpenFGA and collected those figures.
+
+  From RISKS.md:
+  Check: ≥1000 req/s sustained (current: 483 req/s OpenFGA)
+  Confidence Level: 60% (based on architectural analysis, not tested)
+
+  From the ADR notes:
+  All performance-related ADRs validated on 2026-01-29 via k6 load testing against PostgreSQL backend.
+
+  That validation date only applies to the RSFGA measurements. No date, version, or methodology is given for where 483
+  req/s came from.
+
+  ---
+  What Was Actually Measured (RSFGA Side)
+
+  Date: 2026-01-29
+  Method: k6 load tests, 100 VUs, 1 minute sustained
+  Environment: PostgreSQL backend, Apple Silicon (M-series), Docker Desktop
+  Authorization model: Simple document/user model with direct + union relations
+
+  ┌──────────────┬──────────────────┬────────────────────────────┬─────────────────────┐
+  │  Operation   │  RSFGA Measured  │ Claimed "OpenFGA Baseline" │ Claimed Improvement │
+  ├──────────────┼──────────────────┼────────────────────────────┼─────────────────────┤
+  │ Check        │ 1,919 req/s      │ 483 req/s                  │ 4.0x                │
+  ├──────────────┼──────────────────┼────────────────────────────┼─────────────────────┤
+  │ Batch-Check  │ ~16,000 checks/s │ 23 checks/s                │ ~700x               │
+  ├──────────────┼──────────────────┼────────────────────────────┼─────────────────────┤
+  │ Write        │ 459 req/s        │ 59 req/s                   │ 7.8x                │
+  ├──────────────┼──────────────────┼────────────────────────────┼─────────────────────┤
+  │ List-Objects │ 176 req/s        │ 52 req/s                   │ 3.4x                │
+  └──────────────┴──────────────────┴────────────────────────────┴─────────────────────┘
+
+  Latencies (RSFGA only):
+  - Check p95: 1.88ms, p99: 3.16ms (96% cache hit rate)
+  - Write p95: 33ms, p99: 39ms
+  - List-Objects p95: 5.9ms
+
+  ---
+  Specific Gaps / Caveats
+
+  1. OpenFGA version: Mentioned as v1.8.x in one place ("Tested against OpenFGA v1.8.x behavior"), but only in the
+  context of API compatibility testing — not performance benchmarking. No version pinned in a benchmark setup.
+  2. No side-by-side Docker run: The docker-compose.openfga.yml file is referenced in a plan doc for compatibility
+  testing, not for performance comparison. The load test README only targets RSFGA's own endpoint.
+  3. The 700x batch improvement is largely self-referential: OpenFGA's 23 checks/s is sequential with no deduplication;
+  RSFGA's ~16,000 checks/s uses singleflight + parallel execution. These are architecturally different, making the
+  comparison meaningful as a design argument but not a like-for-like test.
+  4. Cache influence: The 1,919 req/s Check result was measured with a 96% cache hit rate. Cold-cache RSFGA performance
+  vs. uncached OpenFGA was never directly compared.
+  5. Hardware mismatch: RSFGA benchmarks ran on Apple Silicon M-series. The OpenFGA baselines have no recorded hardware
+  or environment.
+
+  ---
+  Summary
+
+  The OpenFGA baseline numbers are design-time reference values (likely sourced from OpenFGA's own published benchmarks
+  or community reports), not freshly measured by this project. RSFGA's own numbers are real and validated via k6 on
+  2026-01-29 against PostgreSQL on Apple Silicon. The comparison is meaningful directionally — particularly for the
+  architectural choices like parallel union traversal and batch deduplication — but it is not a controlled head-to-head
+  benchmark using identical hardware, model, and data.
