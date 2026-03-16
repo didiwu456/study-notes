@@ -1,0 +1,216 @@
+ ---
+  The Core Problem: Async Recursion in Rust
+
+  Rust doesn't allow async fn to call itself directly (or transitively) because the compiler must know the size of every future at compile time. A recursive async function would have an infinitely-sized type:
+
+  resolve_check → resolve_userset → resolve_check → resolve_userset → ...
+
+  The compiler can't represent this. The solution is BoxFuture.
+
+  ---
+  Problem 1: Async Recursion via BoxFuture
+
+  Line 91:
+  type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+  This is a type-erased, heap-allocated future. Instead of the compiler needing to know the exact recursive type, every recursive call produces a Box<dyn Future> of a known, fixed size — a fat pointer (16
+  bytes on 64-bit) regardless of what's inside.
+
+  The two recursive functions use it explicitly:
+
+  // resolve_check (line 504) — returns BoxFuture, NOT async fn
+  fn resolve_check(&self, request: CheckRequest, ctx: TraversalContext)
+      -> BoxFuture<'_, DomainResult<CheckResult>>
+  {
+      Box::pin(async move {   // ← heap allocates this future
+          // ...
+          self.resolve_userset(...).await   // ← recursive call, resolved at runtime
+      })
+  }
+
+  // resolve_userset (line 561) — same pattern
+  fn resolve_userset(&self, ...) -> BoxFuture<'_, DomainResult<CheckResult>> {
+      Box::pin(async move {
+          match userset {
+              Userset::ComputedUserset { .. } => {
+                  self.resolve_check(new_request, new_ctx).await  // ← recursive
+              }
+              // ...
+          }
+      })
+  }
+
+  Box::pin does two things:
+  1. Allocates the async block on the heap (so the size is just a pointer)
+  2. Pins it in memory (required by the Future trait — futures can't move after being polled)
+
+  The '_ lifetime ties the future to &self, so the resolver stays alive for the duration. The async move captures all arguments by value (ownership), which is why CheckRequest, TraversalContext, String etc.
+  are passed by value throughout — they're moved into the closure.
+
+  ---
+  Problem 2: Parallel Branches via FuturesUnordered
+
+  For union/intersection, multiple branches need to run concurrently. The key tool is FuturesUnordered from the futures crate.
+
+  What FuturesUnordered actually does
+
+  It's a collection of futures that can be polled concurrently within a single Tokio task. Important distinction:
+
+  - It does not spawn new OS threads
+  - It does not spawn new Tokio tasks (tokio::spawn)
+  - It interleaves polling of all futures within the current task's execution slice
+
+  When you .await a FuturesUnordered, Tokio's runtime polls each future in the set. When one future suspends (e.g., waiting for a MySQL response), Tokio polls the next one instead of blocking. This is
+  cooperative multitasking within the task.
+
+  Union branch (lines 876–938):
+
+  // 1. Build the set — futures are NOT yet started, just created
+  let mut futures: FuturesUnordered<_> = children
+      .into_iter()
+      .map(|child| {
+          self.resolve_userset(
+              request.clone(),   // ← cloned for each branch
+              child,
+              type_constraints.clone(),
+              object_type.clone(),
+              object_id.clone(),
+              ctx.clone(),       // ← each branch gets its own copy of visited set
+          )
+      })
+      .collect();
+
+  // 2. Drive the set — futures run concurrently as this loop yields
+  while let Some(result) = futures.next().await {
+      match result {
+          Ok(CheckResult { allowed: true }) => {
+              return Ok(CheckResult { allowed: true });
+              // ↑ DROP of `futures` here cancels all remaining futures
+          }
+          Ok(CheckResult { allowed: false }) => { had_false_result = true; }
+          Err(e) => { /* classify and store */ }
+      }
+  }
+
+  The crucial line is futures.next().await. That .await is the yield point — it hands control back to Tokio, which can then poll whichever branch is ready (e.g., whichever DB query completed first). When any
+  branch produces a result, the loop body runs.
+
+  Short-circuiting: when return Ok(CheckResult { allowed: true }) fires, the futures variable is dropped. Dropping a FuturesUnordered cancels all in-progress futures — their tasks won't be polled again, and
+  any in-flight DB connections will be dropped/recycled.
+
+  Intersection branch (lines 958–991):
+
+  Same structure but short-circuits on allowed: false. Any error also short-circuits immediately (unlike union, which tolerates cycle/depth errors).
+
+  Exclusion branch (lines 1014–1032):
+
+  // futures::future::join runs both concurrently but waits for BOTH
+  let (base_result, subtract_result) = futures::future::join(
+      self.resolve_userset(request.clone(), base, ...),
+      self.resolve_userset(request,         subtract, ...),
+  ).await;
+
+  join (vs FuturesUnordered) is used here because both results are always needed to compute base AND NOT subtract. No short-circuit is possible until both complete.
+
+  ---
+  Problem 3: Sharing State Across Concurrent Branches
+
+  Each branch needs independent state but must share the immutable resolver. Here's how each piece of data is handled:
+
+  &self (the GraphResolver)
+
+  Immutable reference, shared freely. Rust's borrow checker allows any number of &self references to coexist. The BoxFuture<'_> lifetime ties the futures to this reference.
+
+  CheckRequest (per-branch copy)
+
+  CheckRequest is cloned for each union branch (line 880). It contains:
+  - store_id, user, relation, object — String, cheap to clone
+  - contextual_tuples: Arc<Vec<ContextualTuple>> — Arc::clone is a single atomic increment, O(1)
+  - context: HashMap<String, Value> — cloned (can be expensive if large, but typically small)
+
+  TraversalContext — the clever part
+
+  pub(crate) struct TraversalContext {
+      pub(crate) depth: u32,
+      pub(crate) visited: Arc<HashSet<String>>,
+  }
+
+  ctx.clone() at line 885 is called for each branch. What happens:
+
+  impl Clone for TraversalContext {
+      // derived: depth is Copy, visited is Arc::clone (atomic refcount bump)
+  }
+
+  - depth: u32 — copied by value (trivial)
+  - visited: Arc<HashSet<String>> — Arc::clone bumps the refcount, O(1), both branches now point to the same HashSet in memory
+
+  This means all branches start with a shared view of visited nodes — they all know what's been visited so far — but they can diverge independently.
+
+  Mutation is copy-on-write (with_visited, context.rs:31):
+  pub(crate) fn with_visited(&self, key: &str) -> Self {
+      let mut new_visited = (*self.visited).clone();  // ← full HashSet clone only here
+      new_visited.insert(key.to_string());
+      Self { depth: self.depth, visited: Arc::new(new_visited) }
+  }
+
+  When a branch adds a visited node, it clones the HashSet and creates a new Arc pointing to the new copy. Other branches still hold the old Arc and see the old set. This is copy-on-write semantics — reads are
+   free (shared Arc), writes are isolated (new Arc).
+
+  Memory consequence: each path of depth N allocates N HashSets, each slightly larger than the previous. But since sets are small and depths are capped at 25, this is O(depth²) worst case in total across all
+  branches — acceptable.
+
+  ---
+  Putting It Together: Execution Model
+
+  Consider: viewer = [user] | editor | viewer from parent
+
+  Tokio task (single)
+      │
+      await check()
+      │
+      await resolve_check()       ← BoxFuture, heap allocated
+      │  ├─ model lookup (await DB)
+      │  └─ await resolve_userset(Union)
+      │       │
+      │       └─ await resolve_union()
+      │            │
+      │            ├─ build FuturesUnordered:
+      │            │    future_A = resolve_userset(This)      ← not yet started
+      │            │    future_B = resolve_userset(Computed)  ← not yet started
+      │            │    future_C = resolve_userset(TupleToUserset) ← not yet started
+      │            │
+      │            └─ while futures.next().await:
+      │
+      │   ┌─────────────────────────────────────────┐
+      │   │  Tokio polls future_A (read_tuples)     │
+      │   │  → sends MySQL query, suspends           │
+      │   │  Tokio polls future_B (read_tuples)     │
+      │   │  → sends MySQL query, suspends           │
+      │   │  Tokio polls future_C (read_tuples)     │
+      │   │  → sends MySQL query, suspends           │
+      │   │  ...waiting for I/O...                  │
+      │   │  MySQL response for B arrives first     │
+      │   │  future_B resumes, returns allowed:true │
+      │   └─────────────────────────────────────────┘
+      │
+      └─ short-circuit: drop futures (cancels A and C)
+         return allowed: true
+
+  The three MySQL queries all fly in-flight concurrently from the same Tokio task. No threads are created — Tokio's I/O reactor (backed by epoll/kqueue) watches all the socket FDs and wakes the task when any
+  one of them has data.
+
+  ---
+  Summary: The Three Mechanisms
+
+  ┌────────────────────────────────────────────────┬─────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────┐
+  │                   Mechanism                    │                 Problem solved                  │                               How                               │
+  ├────────────────────────────────────────────────┼─────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ BoxFuture + Box::pin                           │ Recursive async functions                       │ Heap-allocate each future; break the infinite compile-time type │
+  ├────────────────────────────────────────────────┼─────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ FuturesUnordered + .next().await               │ Parallel branch execution with short-circuit    │ Interleave polling within one Tokio task; drop to cancel        │
+  ├────────────────────────────────────────────────┼─────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ Arc<HashSet> copy-on-write in TraversalContext │ Shared-but-independent visited state per branch │ Arc::clone is O(1) for reads; with_visited copies only on write │
+  └────────────────────────────────────────────────┴─────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────┘
+
+  The result is that a union with 3 branches issues all 3 DB queries concurrently within a single Tokio task, with no thread synchronisation overhead — only the cost of the Arc refcount and the heap
+  allocations for BoxFuture.
