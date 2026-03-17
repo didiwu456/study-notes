@@ -1,0 +1,177 @@
+  ---
+  Overview
+
+  Precompute is a background daemon (rsfga-precompute) that proactively runs authorization checks ahead of time and
+  stores the results in Valkey (Redis-compatible). When a request comes in, the API checks Valkey first — if there's a
+  hit, it returns in sub-millisecond without touching the graph resolver or database.
+
+  ---
+  The Write Path (Background Worker)
+
+  NATS JetStream (CommittedEvents)
+      ↓
+  Classifier → extracts TupleChange / ModelChange
+      ↓
+  Impact Analyzer → finds affected hot-path checks
+      ↓
+  Worker Pool (4 workers) → resolves checks via GraphResolver
+      ↓
+  Valkey → stores PrecomputedResult { allowed, computed_at }
+
+  When a tuple or model changes, the classifier identifies which previously-accessed checks are affected, builds
+  RecomputeJob structs, and the worker pool re-resolves each one via the full graph traversal, then writes the result to
+   Valkey.
+
+  ---
+  The Read Path (API Endpoints)
+
+  On every check or batch_check request:
+
+  1. Skip cache if the request has contextual tuples or CEL context (can't be represented in the key)
+  2. Resolve model_id (from request or DB)
+  3. Build a CheckKey: check:{store_id}:{model_id}:{object_type}:{encoded_object_id}#{relation}@{encoded_user}
+  4. Cache hit → return allowed immediately
+  5. Cache miss → record in hot-path registry for future precomputation, then fall back to full graph resolution
+
+  The model_id in the key is critical — it ensures cached results are invalidated automatically when the authorization
+  model changes.
+
+  ---
+  Hot-Path Registry
+
+  Cache misses are tracked in a Valkey sorted set (hotpath:{store_id}). This tells the impact analyzer which checks are
+  "hot" (frequently accessed), so when data changes, it knows which checks to recompute proactively rather than
+  recomputing everything.
+
+  ---
+  Two Separate Caches
+
+  There are actually two distinct caches:
+
+  ┌──────────────────┬─────────────────────┬──────────────────────────────────┬────────────────────────────┐
+  │      Cache       │      Location       │              Scope               │        Persistence         │
+  ├──────────────────┼─────────────────────┼──────────────────────────────────┼────────────────────────────┤
+  │ Precompute cache │ rsfga-valkey        │ Valkey, includes model_id in key │ Persistent across restarts │
+  ├──────────────────┼─────────────────────┼──────────────────────────────────┼────────────────────────────┤
+  │ In-memory cache  │ rsfga-domain (Moka) │ Per-process, no model_id in key  │ Lost on restart            │
+  └──────────────────┴─────────────────────┴──────────────────────────────────┴────────────────────────────┘
+
+  The Moka cache is used inside the graph resolver for deduplicating recursive traversal within a single request. The
+  Valkey precompute cache is the cross-request, persistent layer.
+
+  ---
+  Graceful Degradation
+
+  If Valkey is unavailable, the API falls back transparently to full graph resolution — no errors returned to clients.
+  Cache writes failing are logged as warnings but don't affect correctness.
+
+
+  ---
+  Precompute + NATS Edge: Check Request Flow
+
+  The Big Picture
+
+  There are two separate but related systems:
+  1. Edge Sync Consumer — keeps edge node storage up-to-date with tuples
+  2. Precompute Worker — resolves checks ahead of time and stores results in Valkey
+
+  These are both driven by the same NATS event stream but serve different purposes.
+
+  ---
+  Write → Event → Sync
+
+  Client Write
+      → Storage persists tuple
+      → rsfga-writer daemon publishes CommittedEvent to NATS stream RSFGA_EVENTS
+          Subject: rsfga.events.{store_id}.committed
+          Payload: { writes: [...], deletes: [...], model_changed: bool, sequence: N }
+
+  Edge Sync Consumer (edge node)
+      → Pulls CommittedEvent from RSFGA_EVENTS
+      → Applies writes/deletes to local edge storage
+      → Updates watermark (idempotency: tracks which sequences applied)
+
+  Precompute Worker (central or edge)
+      → Pulls same CommittedEvent
+      → Classifies: TupleChange(store, object_type, relation) or ModelChange
+      → Runs impact analysis → finds affected hot-path checks
+      → Recomputes via GraphResolver → writes to Valkey with TTL
+
+  ---
+  Check Request at Edge Node
+
+  Check Request arrives (user:alice, viewer, document:readme)
+      │
+      ├─ Has contextual_tuples or context?
+      │   YES → skip cache, go straight to live resolution
+      │   NO  ↓
+      │
+      ├─ Get model_id (from request or latest in storage)
+      │
+      ├─ Build Valkey key:
+      │   "check:{store}:{model_id}:document:readme#viewer@user:alice"
+      │
+      ├─ GET from Valkey
+      │   HIT → return { allowed: true/false }  ← sub-millisecond
+      │   MISS ↓
+      │
+      ├─ Record in hot-path registry (Valkey sorted set):
+      │   ZADD hotpath:{store} {timestamp} "document:readme#viewer@user:alice"
+      │   (This tells the precompute worker to precompute this check next time)
+      │
+      └─ Live resolution via GraphResolver → return result
+
+  ---
+  How the Precompute Worker Knows What to Recompute
+
+  The hot-path registry is a Valkey sorted set tracking which checks have been requested recently. When a tuple changes:
+
+  1. Impact analyzer builds relation dependency graph from the auth model
+    - e.g., owner → editor → viewer means a change to owner tuples affects editor and viewer checks too
+  2. Scans hot-path for all matching entries: ZSCAN hotpath:{store} MATCH "document:*#viewer@*"
+  3. Submits RecomputeJob for each hit → worker resolves via GraphResolver → writes to Valkey
+
+  ---
+  Cache Invalidation
+
+  ┌────────────────────┬───────────────────────────────────────────────────────────┐
+  │      Trigger       │                          Action                           │
+  ├────────────────────┼───────────────────────────────────────────────────────────┤
+  │ Tuple change       │ Impact-based: only affected relation types recomputed     │
+  ├────────────────────┼───────────────────────────────────────────────────────────┤
+  │ Model change       │ Full store invalidation in Valkey + rebuild relation deps │
+  ├────────────────────┼───────────────────────────────────────────────────────────┤
+  │ TTL expiry         │ Default 300s; Valkey automatically evicts                 │
+  ├────────────────────┼───────────────────────────────────────────────────────────┤
+  │ Hot-path staleness │ Entries unused for >1h evicted from registry              │
+  └────────────────────┴───────────────────────────────────────────────────────────┘
+
+  ---
+  Key Files
+
+  ┌──────────────────────────────────────────────┬─────────────────────────────────────────────────┐
+  │                     File                     │                      Role                       │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ crates/rsfga-valkey/src/cache.rs             │ Valkey read/write, hot-path registry            │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ crates/rsfga-valkey/src/keys.rs              │ Cache key construction                          │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ crates/rsfga-precompute/src/worker.rs        │ Recompute job processor                         │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ crates/rsfga-precompute/src/impact.rs        │ Relation dep analysis, affected check scanning  │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ crates/rsfga-edge/src/consumer.rs            │ Edge tuple sync from NATS                       │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ crates/rsfga-nats/src/events.rs              │ CommittedEvent schema                           │
+  ├──────────────────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ crates/rsfga-api/src/grpc/service.rs:520-563 │ Check handler: cache lookup before live resolve │
+  └──────────────────────────────────────────────┴─────────────────────────────────────────────────┘
+
+  ---
+  Consistency Tradeoffs
+
+  - Precomputed cache: Eventually consistent. Stale within TTL window (default 300s) or until recomputed after tuple
+  change.
+  - Edge storage: Eventually consistent with central. Lag depends on NATS delivery timing.
+  - Cache bypassed when: contextual_tuples or context is present (result could differ per-request).
+  - Safe default: Precompute cache is opt-in; live resolution is always the fallback.

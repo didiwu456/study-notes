@@ -1,623 +1,188 @@
   ---
-  Complete Configuration Reference
+  Configuration Loading
 
-  Types imply ranges unless an explicit constraint narrows them:
-  u8: 0–255 · u16: 0–65,535 · u32: 0–4,294,967,295 · u64: 0–18,446,744,073,709,551,615 · usize: 0–2^64−1 · i32/i64:
-  signed · f64 jitter: typed 0.0–∞ but semantically 0.0–1.0 · bool: true/false · Duration: 0s–∞ · Option<T>: None or T's
-   range
-
-  ---
-  1 · GraphResolver (rsfga-domain/src/resolver/config.rs)
-
-  ┌───────────┬─────────────────────────┬─────────────────┬─────────────┬────────────┬──────────────────────────────┐
-  │   Field   │          Type           │   Type range    │  Explicit   │  Default   │         Description          │
-  │           │                         │                 │ constraint  │            │                              │
-  ├───────────┼─────────────────────────┼─────────────────┼─────────────┼────────────┼──────────────────────────────┤
-  │           │                         │                 │             │            │ Maximum traversal depth      │
-  │ max_depth │ u32                     │ 0–4,294,967,295 │ —           │ 25         │ before DepthLimitExceeded.   │
-  │           │                         │                 │             │            │ Matches OpenFGA's limit;     │
-  │           │                         │                 │             │            │ prevents DoS.                │
-  ├───────────┼─────────────────────────┼─────────────────┼─────────────┼────────────┼──────────────────────────────┤
-  │ timeout   │ Duration                │ 0–∞             │ —           │ 30s        │ Per-request resolver         │
-  │           │                         │                 │             │            │ timeout.                     │
-  ├───────────┼─────────────────────────┼─────────────────┼─────────────┼────────────┼──────────────────────────────┤
-  │ cache     │ Option<Arc<CheckCache>> │ None / cache    │ —           │ None       │ Plugged-in check cache; None │
-  │           │                         │                 │             │ (disabled) │  means no caching.           │
-  └───────────┴─────────────────────────┴─────────────────┴─────────────┴────────────┴──────────────────────────────┘
+  Environment variables override config file values, which override defaults.
+  - Env var format: RSFGA_<SECTION>__<FIELD> (double underscore as separator)
+  - CLI: rsfga --config /path/to/config.yaml
 
   ---
-  2 · CheckCache (rsfga-domain/src/cache/mod.rs)
+  All Configuration Options
 
-  ┌──────────────┬──────────┬──────────────┬──────────────────┬─────────┬──────────────────────────────────────────┐
-  │    Field     │   Type   │  Type range  │    Explicit      │ Default │               Description                │
-  │              │          │              │    constraint    │         │                                          │
-  ├──────────────┼──────────┼──────────────┼──────────────────┼─────────┼──────────────────────────────────────────┤
-  │ enabled      │ bool     │ true/false   │ —                │ false   │ Master switch for in-process check       │
-  │              │          │              │                  │         │ result caching.                          │
-  ├──────────────┼──────────┼──────────────┼──────────────────┼─────────┼──────────────────────────────────────────┤
-  │ max_capacity │ u64      │ 0–18.4 ×     │ —                │ 100,000 │ Max entries in the Moka LRU/LFU cache.   │
-  │              │          │ 10¹⁸         │                  │         │                                          │
-  ├──────────────┼──────────┼──────────────┼──────────────────┼─────────┼──────────────────────────────────────────┤
-  │ default_ttl  │ Duration │ 0–∞          │ —                │ 10s     │ How long a cached true/false result      │
-  │              │          │              │                  │         │ lives.                                   │
-  └──────────────┴──────────┴──────────────┴──────────────────┴─────────┴──────────────────────────────────────────┘
+  server: — HTTP server
 
-  ---
-  3 · CelCache (rsfga-domain/src/cel/cache.rs)
+  ┌──────────────────────┬─────────┬────────────────────────────────────┬────────────────────────────┐
+  │        Field         │ Default │              Env Var               │        Description         │
+  ├──────────────────────┼─────────┼────────────────────────────────────┼────────────────────────────┤
+  │ host                 │ 0.0.0.0 │ RSFGA_SERVER__HOST                 │ Bind address               │
+  ├──────────────────────┼─────────┼────────────────────────────────────┼────────────────────────────┤
+  │ port                 │ 8080    │ RSFGA_SERVER__PORT                 │ HTTP port (must be > 0)    │
+  ├──────────────────────┼─────────┼────────────────────────────────────┼────────────────────────────┤
+  │ request_timeout_secs │ 30      │ RSFGA_SERVER__REQUEST_TIMEOUT_SECS │ Per-request timeout        │
+  ├──────────────────────┼─────────┼────────────────────────────────────┼────────────────────────────┤
+  │ max_connections      │ 10000   │ RSFGA_SERVER__MAX_CONNECTIONS      │ Max concurrent connections │
+  └──────────────────────┴─────────┴────────────────────────────────────┴────────────────────────────┘
 
-  ┌──────────────┬──────────┬───────────────┬─────────────────────┬─────────┬─────────────────────────────────────┐
-  │    Field     │   Type   │  Type range   │ Explicit constraint │ Default │             Description             │
-  ├──────────────┼──────────┼───────────────┼─────────────────────┼─────────┼─────────────────────────────────────┤
-  │ max_capacity │ u64      │ 0–18.4 × 10¹⁸ │ —                   │ 10,000  │ Max parsed CEL AST entries.         │
-  ├──────────────┼──────────┼───────────────┼─────────────────────┼─────────┼─────────────────────────────────────┤
-  │ ttl          │ Duration │ 0–∞           │ —                   │ 1h      │ TTL for each cached CEL expression. │
-  └──────────────┴──────────┴───────────────┴─────────────────────┴─────────┴─────────────────────────────────────┘
+  grpc: — gRPC server
 
-  ---
-  4 · Server (rsfga-server/src/config.rs → ServerSettings)
+  ┌──────────────┬─────────┬──────────────────────────┬───────────────────────────────┐
+  │    Field     │ Default │         Env Var          │          Description          │
+  ├──────────────┼─────────┼──────────────────────────┼───────────────────────────────┤
+  │ enabled      │ true    │ RSFGA_GRPC__ENABLED      │ Enable gRPC server            │
+  ├──────────────┼─────────┼──────────────────────────┼───────────────────────────────┤
+  │ port         │ 50051   │ RSFGA_GRPC__PORT         │ gRPC port                     │
+  ├──────────────┼─────────┼──────────────────────────┼───────────────────────────────┤
+  │ reflection   │ true    │ RSFGA_GRPC__REFLECTION   │ gRPC reflection (for grpcurl) │
+  ├──────────────┼─────────┼──────────────────────────┼───────────────────────────────┤
+  │ health_check │ true    │ RSFGA_GRPC__HEALTH_CHECK │ gRPC health check service     │
+  └──────────────┴─────────┴──────────────────────────┴───────────────────────────────┘
 
-  ┌──────────────────────┬────────┬───────────┬────────────────────┬───────────┬───────────────────────────────────┐
-  │        Field         │  Type  │   Type    │     Explicit       │  Default  │            Description            │
-  │                      │        │   range   │     constraint     │           │                                   │
-  ├──────────────────────┼────────┼───────────┼────────────────────┼───────────┼───────────────────────────────────┤
-  │ host                 │ String │ —         │ —                  │ "0.0.0.0" │ Bind address for the HTTP server. │
-  ├──────────────────────┼────────┼───────────┼────────────────────┼───────────┼───────────────────────────────────┤
-  │ port                 │ u16    │ 0–65,535  │ > 0                │ 8080      │ HTTP listen port.                 │
-  ├──────────────────────┼────────┼───────────┼────────────────────┼───────────┼───────────────────────────────────┤
-  │ request_timeout_secs │ u64    │ 0–∞       │ —                  │ 30        │ Per-request timeout in seconds.   │
-  ├──────────────────────┼────────┼───────────┼────────────────────┼───────────┼───────────────────────────────────┤
-  │ max_connections      │ usize  │ 0–2⁶⁴−1   │ —                  │ 10,000    │ Maximum concurrent HTTP           │
-  │                      │        │           │                    │           │ connections.                      │
-  └──────────────────────┴────────┴───────────┴────────────────────┴───────────┴───────────────────────────────────┘
+  storage: — data backend
 
-  ---
-  5 · gRPC (GrpcSettings)
+  ┌─────────────────────────┬─────────┬────────────────────────────────────────┬───────────────────────────────────────────────┐
+  │          Field          │ Default │                Env Var                 │                  Description                  │
+  ├─────────────────────────┼─────────┼────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ backend                 │ memory  │ RSFGA_STORAGE__BACKEND                 │ memory, postgres, mysql, cockroachdb, rocksdb │
+  ├─────────────────────────┼─────────┼────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ database_url            │ —       │ RSFGA_STORAGE__DATABASE_URL            │ Required for postgres/mysql/cockroachdb       │
+  ├─────────────────────────┼─────────┼────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ data_path               │ —       │ RSFGA_STORAGE__DATA_PATH               │ Required for rocksdb (e.g. /data/rsfga)       │
+  ├─────────────────────────┼─────────┼────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ pool_size               │ 10      │ RSFGA_STORAGE__POOL_SIZE               │ DB connection pool size                       │
+  ├─────────────────────────┼─────────┼────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ connection_timeout_secs │ 5       │ RSFGA_STORAGE__CONNECTION_TIMEOUT_SECS │ DB connect timeout                            │
+  └─────────────────────────┴─────────┴────────────────────────────────────────┴───────────────────────────────────────────────┘
 
-  ┌──────────────┬──────┬────────────┬─────────────────────┬─────────┬─────────────────────────────────────────────┐
-  │    Field     │ Type │ Type range │ Explicit constraint │ Default │                 Description                 │
-  ├──────────────┼──────┼────────────┼─────────────────────┼─────────┼─────────────────────────────────────────────┤
-  │ enabled      │ bool │ true/false │ —                   │ true    │ Enable the gRPC server alongside HTTP.      │
-  ├──────────────┼──────┼────────────┼─────────────────────┼─────────┼─────────────────────────────────────────────┤
-  │ port         │ u16  │ 0–65,535   │ —                   │ 50051   │ gRPC listen port (standard gRPC port).      │
-  ├──────────────┼──────┼────────────┼─────────────────────┼─────────┼─────────────────────────────────────────────┤
-  │ reflection   │ bool │ true/false │ —                   │ true    │ Enable gRPC reflection (grpcurl discovery). │
-  ├──────────────┼──────┼────────────┼─────────────────────┼─────────┼─────────────────────────────────────────────┤
-  │ health_check │ bool │ true/false │ —                   │ true    │ Enable standard gRPC health check service.  │
-  └──────────────┴──────┴────────────┴─────────────────────┴─────────┴─────────────────────────────────────────────┘
+  logging:
 
-  ---
-  6 · Storage (StorageSettings)
+  ┌───────┬─────────┬──────────────────────┬──────────────────────────────────────────┐
+  │ Field │ Default │       Env Var        │               Description                │
+  ├───────┼─────────┼──────────────────────┼──────────────────────────────────────────┤
+  │ level │ info    │ RSFGA_LOGGING__LEVEL │ trace, debug, info, warn, error          │
+  ├───────┼─────────┼──────────────────────┼──────────────────────────────────────────┤
+  │ json  │ false   │ RSFGA_LOGGING__JSON  │ JSON format (recommended for production) │
+  └───────┴─────────┴──────────────────────┴──────────────────────────────────────────┘
 
-  ┌─────────────────────────┬────────────────┬─────────────────┬────────────────────────────┬──────────┬─────────────┐
-  │          Field          │      Type      │   Type range    │    Explicit constraint     │ Default  │ Description │
-  ├─────────────────────────┼────────────────┼─────────────────┼────────────────────────────┼──────────┼─────────────┤
-  │                         │                │                 │ One of: memory, postgres,  │          │ Storage     │
-  │ backend                 │ String         │ —               │ mysql, cockroachdb,        │ "memory" │ backend to  │
-  │                         │                │                 │ rocksdb                    │          │ use.        │
-  ├─────────────────────────┼────────────────┼─────────────────┼────────────────────────────┼──────────┼─────────────┤
-  │                         │                │                 │                            │          │ Connection  │
-  │ database_url            │ Option<String> │ —               │ Required (non-empty) for   │ None     │ string for  │
-  │                         │                │                 │ postgres/mysql/cockroachdb │          │ DB          │
-  │                         │                │                 │                            │          │ backends.   │
-  ├─────────────────────────┼────────────────┼─────────────────┼────────────────────────────┼──────────┼─────────────┤
-  │                         │                │                 │                            │          │ Data        │
-  │ data_path               │ Option<String> │ —               │ Required (non-empty) for   │ None     │ directory   │
-  │                         │                │                 │ rocksdb                    │          │ for         │
-  │                         │                │                 │                            │          │ RocksDB.    │
-  ├─────────────────────────┼────────────────┼─────────────────┼────────────────────────────┼──────────┼─────────────┤
-  │                         │                │                 │                            │          │ Connection  │
-  │ pool_size               │ u32            │ 0–4,294,967,295 │ —                          │ 10       │ pool size   │
-  │                         │                │                 │                            │          │ passed to   │
-  │                         │                │                 │                            │          │ DB backend. │
-  ├─────────────────────────┼────────────────┼─────────────────┼────────────────────────────┼──────────┼─────────────┤
-  │                         │                │                 │                            │          │ Connection  │
-  │ connection_timeout_secs │ u64            │ 0–∞             │ —                          │ 5        │ acquire     │
-  │                         │                │                 │                            │          │ timeout in  │
-  │                         │                │                 │                            │          │ seconds.    │
-  └─────────────────────────┴────────────────┴─────────────────┴────────────────────────────┴──────────┴─────────────┘
+  metrics:
 
-  ---
-  7 · PostgreSQL (rsfga-storage/src/postgres.rs → PostgresConfig)
+  ┌─────────┬──────────┬────────────────────────┬──────────────────────────────┐
+  │  Field  │ Default  │        Env Var         │         Description          │
+  ├─────────┼──────────┼────────────────────────┼──────────────────────────────┤
+  │ enabled │ true     │ RSFGA_METRICS__ENABLED │ Expose /metrics (Prometheus) │
+  ├─────────┼──────────┼────────────────────────┼──────────────────────────────┤
+  │ path    │ /metrics │ RSFGA_METRICS__PATH    │ Metrics endpoint path        │
+  └─────────┴──────────┴────────────────────────┴──────────────────────────────┘
 
-  Field: database_url
-  Type: String
-  Type range: —
-  Explicit constraint: Non-empty
-  Default: "postgres://localhost/rsfga"
-  Description: PostgreSQL connection URL. Credentials redacted in Debug.
-  ────────────────────────────────────────
-  Field: max_connections
-  Type: u32
-  Type range: 0–4,294,967,295
-  Explicit constraint: > 0 (implied)
-  Default: 10
-  Description: Max connections in SQLx pool.
-  ────────────────────────────────────────
-  Field: min_connections
-  Type: u32
-  Type range: 0–4,294,967,295
-  Explicit constraint: ≤ max
-  Default: 1
-  Description: Min idle connections kept open.
-  ────────────────────────────────────────
-  Field: connect_timeout_secs
-  Type: u64
-  Type range: 0–∞
-  Explicit constraint: —
-  Default: 30
-  Description: Pool acquire timeout (SQLx acquire_timeout).
-  ────────────────────────────────────────
-  Field: query_timeout_secs
-  Type: u64
-  Type range: 0–∞
-  Explicit constraint: —
-  Default: 30
-  Description: Default per-query deadline.
-  ────────────────────────────────────────
-  Field: read_timeout_secs
-  Type: Option<u64>
-  Type range: None / 0–∞
-  Explicit constraint: —
-  Default: None
-  Description: Read-op timeout; falls back to query_timeout_secs.
-  ────────────────────────────────────────
-  Field: write_timeout_secs
-  Type: Option<u64>
-  Type range: None / 0–∞
-  Explicit constraint: —
-  Default: None
-  Description: Write-op timeout; falls back to query_timeout_secs.
-  ────────────────────────────────────────
-  Field: health_check_timeout_secs
-  Type: u64
-  Type range: 0–∞
-  Explicit constraint: —
-  Default: 5
-  Description: Timeout for /healthz probe queries (shorter than query timeout).
+  tracing: — OpenTelemetry/Jaeger
+
+  ┌─────────────────┬────────────────┬────────────────────────────────┬────────────────────────────┐
+  │      Field      │    Default     │            Env Var             │        Description         │
+  ├─────────────────┼────────────────┼────────────────────────────────┼────────────────────────────┤
+  │ enabled         │ false          │ RSFGA_TRACING__ENABLED         │ Enable distributed tracing │
+  ├─────────────────┼────────────────┼────────────────────────────────┼────────────────────────────┤
+  │ jaeger_endpoint │ localhost:6831 │ RSFGA_TRACING__JAEGER_ENDPOINT │ Jaeger UDP agent endpoint  │
+  ├─────────────────┼────────────────┼────────────────────────────────┼────────────────────────────┤
+  │ service_name    │ rsfga          │ RSFGA_TRACING__SERVICE_NAME    │ Trace service label        │
+  └─────────────────┴────────────────┴────────────────────────────────┴────────────────────────────┘
+
+  nats: — async writes + RYOW (requires --features nats)
+
+  ┌───────────────────────┬───────────────────────┬───────────────────────────────────┬─────────────────────────────────────────────────────────────┐
+  │         Field         │        Default        │              Env Var              │                         Description                         │
+  ├───────────────────────┼───────────────────────┼───────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+  │ enabled               │ false                 │ RSFGA_NATS__ENABLED               │ Enable NATS integration                                     │
+  ├───────────────────────┼───────────────────────┼───────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+  │ url                   │ nats://localhost:4222 │ RSFGA_NATS__URL                   │ NATS server URL                                             │
+  ├───────────────────────┼───────────────────────┼───────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+  │ name                  │ rsfga-api             │ RSFGA_NATS__NAME                  │ Connection name                                             │
+  ├───────────────────────┼───────────────────────┼───────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+  │ ryow_timeout_secs     │ 30                    │ RSFGA_NATS__RYOW_TIMEOUT_SECS     │ Max wait for write-ticket commit before 504                 │
+  ├───────────────────────┼───────────────────────┼───────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+  │ write_ticket_ttl_secs │ 60                    │ RSFGA_NATS__WRITE_TICKET_TTL_SECS │ Write ticket validity for RYOW                              │
+  ├───────────────────────┼───────────────────────┼───────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+  │ write_mode            │ direct                │ RSFGA_NATS__WRITE_MODE            │ direct (sync), nats (async), auto (nats with sync fallback) │
+  └───────────────────────┴───────────────────────┴───────────────────────────────────┴─────────────────────────────────────────────────────────────┘
+
+  precompute: — Valkey/Redis cache (requires --features precompute)
+
+  ┌──────────────────┬────────────────────────┬────────────────────────────────────┬──────────────────────────────────────────────────────────────────────┐
+  │      Field       │        Default         │              Env Var               │                             Description                              │
+  ├──────────────────┼────────────────────────┼────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ enabled          │ false                  │ RSFGA_PRECOMPUTE__ENABLED          │ Enable precomputed check cache                                       │
+  ├──────────────────┼────────────────────────┼────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ valkey_url       │ redis://localhost:6379 │ RSFGA_PRECOMPUTE__VALKEY_URL       │ Supports redis://, rediss:// (TLS), redis+sentinel://, redis+unix:// │
+  ├──────────────────┼────────────────────────┼────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ result_ttl_secs  │ 300                    │ RSFGA_PRECOMPUTE__RESULT_TTL_SECS  │ TTL for cached check results (must be > 0)                           │
+  ├──────────────────┼────────────────────────┼────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+  │ hotpath_ttl_secs │ 3600                   │ RSFGA_PRECOMPUTE__HOTPATH_TTL_SECS │ TTL for hot-path registry entries (must be > 0)                      │
+  └──────────────────┴────────────────────────┴────────────────────────────────────┴──────────────────────────────────────────────────────────────────────┘
 
   ---
-  8 · MySQL / MariaDB / TiDB (rsfga-storage/src/mysql.rs → MySQLConfig)
+  Full config.yaml example
 
-  Same fields as PostgreSQL plus one extra:
+  server:
+    host: "0.0.0.0"
+    port: 8080
+    request_timeout_secs: 30
+    max_connections: 10000
 
-  Field: database_url
-  Type: String
-  Type range: —
-  Explicit constraint: Non-empty
-  Default: "mysql://localhost/rsfga"
-  Description: MySQL connection URL. Credentials redacted in Debug.
-  ────────────────────────────────────────
-  Field: max_connections
-  Type: u32
-  Type range: 0–4,294,967,295
-  Explicit constraint: > 0 (implied)
-  Default: 10
-  Description: Max connections in SQLx pool.
-  ────────────────────────────────────────
-  Field: min_connections
-  Type: u32
-  Type range: 0–4,294,967,295
-  Explicit constraint: ≤ max
-  Default: 1
-  Description: Min idle connections kept open.
-  ────────────────────────────────────────
-  Field: connect_timeout_secs
-  Type: u64
-  Type range: 0–∞
-  Explicit constraint: —
-  Default: 30
-  Description: Pool acquire timeout.
-  ────────────────────────────────────────
-  Field: query_timeout_secs
-  Type: u64
-  Type range: 0–∞
-  Explicit constraint: —
-  Default: 30
-  Description: Default per-query deadline.
-  ────────────────────────────────────────
-  Field: read_timeout_secs
-  Type: Option<u64>
-  Type range: None / 0–∞
-  Explicit constraint: —
-  Default: None
-  Description: Read-op override; falls back to query_timeout_secs.
-  ────────────────────────────────────────
-  Field: write_timeout_secs
-  Type: Option<u64>
-  Type range: None / 0–∞
-  Explicit constraint: —
-  Default: None
-  Description: Write-op override; falls back to query_timeout_secs.
-  ────────────────────────────────────────
-  Field: health_check_timeout_secs
-  Type: u64
-  Type range: 0–∞
-  Explicit constraint: —
-  Default: 5
-  Description: Health probe query timeout.
-  ────────────────────────────────────────
-  Field: write_batch_size
-  Type: usize
-  Type range: 0–2⁶⁴−1
-  Explicit constraint: 1–9,000 (practical MySQL placeholder limit)
-  Default: 1,000
-  Description: Tuples per INSERT/DELETE batch. Max safe for MySQL's ~65,535 placeholder cap with 7 columns is ~9,000.
+  grpc:
+    enabled: true
+    port: 50051
+    reflection: true
+    health_check: true
+
+  storage:
+    backend: postgres
+    database_url: "postgres://user:password@localhost:5432/rsfga"
+    pool_size: 20
+    connection_timeout_secs: 5
+
+  logging:
+    level: info
+    json: true
+
+  metrics:
+    enabled: true
+    path: /metrics
+
+  tracing:
+    enabled: false
+    jaeger_endpoint: "localhost:6831"
+    service_name: rsfga
+
+  nats:
+    enabled: false
+    url: "nats://localhost:4222"
+    name: "rsfga-api"
+    ryow_timeout_secs: 30
+    write_ticket_ttl_secs: 60
+    write_mode: "direct"
+
+  precompute:
+    enabled: false
+    valkey_url: "redis://localhost:6379"
+    result_ttl_secs: 300
+    hotpath_ttl_secs: 3600
 
   ---
-  9 · Logging (LoggingSettings)
+  Startup validation (fatal errors)
 
-  ┌───────┬────────┬────────────────────────────────────────┬─────────┬─────────────────────────────────────────────┐
-  │ Field │  Type  │          Explicit constraint           │ Default │                 Description                 │
-  ├───────┼────────┼────────────────────────────────────────┼─────────┼─────────────────────────────────────────────┤
-  │ level │ String │ One of: trace, debug, info, warn,      │ "info"  │ Minimum log level.                          │
-  │       │        │ error                                  │         │                                             │
-  ├───────┼────────┼────────────────────────────────────────┼─────────┼─────────────────────────────────────────────┤
-  │ json  │ bool   │ —                                      │ false   │ JSON structured output (true for            │
-  │       │        │                                        │         │ production).                                │
-  └───────┴────────┴────────────────────────────────────────┴─────────┴─────────────────────────────────────────────┘
-
-  ---
-  10 · Metrics (MetricsSettings)
-
-  ┌─────────┬────────┬────────────┬────────────────────────────────────────────┐
-  │  Field  │  Type  │  Default   │                Description                 │
-  ├─────────┼────────┼────────────┼────────────────────────────────────────────┤
-  │ enabled │ bool   │ true       │ Expose Prometheus /metrics endpoint.       │
-  ├─────────┼────────┼────────────┼────────────────────────────────────────────┤
-  │ path    │ String │ "/metrics" │ HTTP path for the metrics scrape endpoint. │
-  └─────────┴────────┴────────────┴────────────────────────────────────────────┘
-
-  ---
-  11 · Tracing (TracingSettings)
-
-  ┌─────────────────┬────────┬──────────────────┬──────────────────────────────────────────────────┐
-  │      Field      │  Type  │     Default      │                   Description                    │
-  ├─────────────────┼────────┼──────────────────┼──────────────────────────────────────────────────┤
-  │ enabled         │ bool   │ false            │ Enable OpenTelemetry/Jaeger distributed tracing. │
-  ├─────────────────┼────────┼──────────────────┼──────────────────────────────────────────────────┤
-  │ jaeger_endpoint │ String │ "localhost:6831" │ Jaeger agent UDP endpoint.                       │
-  ├─────────────────┼────────┼──────────────────┼──────────────────────────────────────────────────┤
-  │ service_name    │ String │ "rsfga"          │ Service name attached to all spans.              │
-  └─────────────────┴────────┴──────────────────┴──────────────────────────────────────────────────┘
-
-  ---
-  12 · NATS (server config — NatsSettings)
-
-  Field: enabled
-  Type: bool
-  Type range: true/false
-  Explicit constraint: —
-  Default: false
-  Description: Enable NATS JetStream integration.
-  ────────────────────────────────────────
-  Field: url
-  Type: String
-  Type range: —
-  Explicit constraint: Non-empty
-  Default: "nats://localhost:4222"
-  Description: NATS server URL.
-  ────────────────────────────────────────
-  Field: name
-  Type: String
-  Type range: —
-  Explicit constraint: —
-  Default: "rsfga-api"
-  Description: Connection name visible in NATS server logs.
-  ────────────────────────────────────────
-  Field: ryow_timeout_secs
-  Type: u64
-  Type range: 0–∞
-  Explicit constraint: —
-  Default: 30
-  Description: Max time a read handler waits for a write ticket before returning 504.
-  ────────────────────────────────────────
-  Field: write_ticket_ttl_secs
-  Type: u64
-  Type range: 0–∞
-  Explicit constraint: —
-  Default: 60
-  Description: How long a RYOW write ticket stays valid.
-  ────────────────────────────────────────
-  Field: write_mode
-  Type: String
-  Type range: —
-  Explicit constraint: One of: nats, direct, auto
-  Default: "direct"
-  Description: Write path strategy: direct=sync only; nats=async only; auto=NATS with sync fallback.
-
-  ---
-  13 · NATS Client (rsfga-nats/src/config.rs → NatsConfig)
-
-  ┌──────────────────────────┬───────────────┬───────────────┬─────────────┬───────────────────────┬───────────────┐
-  │          Field           │     Type      │  Type range   │  Explicit   │        Default        │  Description  │
-  │                          │               │               │ constraint  │                       │               │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │ url                      │ String        │ —             │ —           │ "nats://localhost:422 │ NATS server   │
-  │                          │               │               │             │ 2"                    │ URL.          │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │                          │               │               │             │                       │ Client        │
-  │ name                     │ String        │ —             │ —           │ "rsfga"               │ connection    │
-  │                          │               │               │             │                       │ name.         │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │ reconnect.initial_delay_ │               │               │             │                       │ First         │
-  │ ms                       │ u64           │ 0–∞           │ —           │ 100ms                 │ reconnect     │
-  │                          │               │               │             │                       │ backoff.      │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │ reconnect.max_delay_ms   │ u64           │ 0–∞           │ ≥ initial   │ 30,000ms              │ Max reconnect │
-  │                          │               │               │             │                       │  backoff cap. │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │                          │               │               │             │                       │ Jitter        │
-  │ reconnect.jitter         │ f64           │ 0.0–∞         │ semanticall │ 0.1                   │ fraction      │
-  │                          │               │               │ y 0.0–1.0   │                       │ added to      │
-  │                          │               │               │             │                       │ backoff.      │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │ reconnect.max_attempts   │ Option<u32>   │ None / 0–4,29 │ —           │ None (infinite)       │ None = retry  │
-  │                          │               │ 4,967,295     │             │                       │ forever.      │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │                          │               │               │             │                       │ NATS auth     │
-  │ auth.token               │ Option<String │ —             │ —           │ None                  │ token.        │
-  │                          │ >             │               │             │                       │ Redacted in   │
-  │                          │               │               │             │                       │ Debug.        │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │ auth.username            │ Option<String │ —             │ —           │ None                  │ NATS          │
-  │                          │ >             │               │             │                       │ username.     │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │                          │               │               │             │                       │ NATS          │
-  │ auth.password            │ Option<String │ —             │ —           │ None                  │ password.     │
-  │                          │ >             │               │             │                       │ Redacted in   │
-  │                          │               │               │             │                       │ Debug.        │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │                          │ Option<String │               │             │                       │ NKey seed.    │
-  │ auth.nkey_seed           │ >             │ —             │ —           │ None                  │ Redacted in   │
-  │                          │               │               │             │                       │ Debug.        │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │ auth.credentials_file    │ Option<String │ —             │ —           │ None                  │ Path to       │
-  │                          │ >             │               │             │                       │ .creds file.  │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │                          │               │               │             │                       │ Enable TLS    │
-  │ tls.enabled              │ bool          │ true/false    │ —           │ false                 │ for NATS      │
-  │                          │               │               │             │                       │ connection.   │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │                          │ Option<String │               │             │                       │ CA            │
-  │ tls.ca_cert              │ >             │ —             │ —           │ None                  │ certificate   │
-  │                          │               │               │             │                       │ path.         │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │ tls.client_cert          │ Option<String │ —             │ —           │ None                  │ Client cert   │
-  │                          │ >             │               │             │                       │ path (mTLS).  │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │ tls.client_key           │ Option<String │ —             │ —           │ None                  │ Client key    │
-  │                          │ >             │               │             │                       │ path (mTLS).  │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │                          │               │               │             │                       │ Skip TLS peer │
-  │ tls.insecure_skip_verify │ bool          │ true/false    │ —           │ false                 │  verification │
-  │                          │               │               │             │                       │  (dev only).  │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │                          │ Option<String │               │             │                       │ JetStream     │
-  │ jetstream.domain         │ >             │ —             │ —           │ None                  │ domain for mu │
-  │                          │               │               │             │                       │ lti-tenancy.  │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │                          │               │               │             │                       │ RSFGA_WRITES  │
-  │ jetstream.writes_stream  │ StreamConfig  │ —             │ —           │ see below             │ stream        │
-  │                          │               │               │             │                       │ config.       │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │                          │               │               │             │                       │ RSFGA_EVENTS  │
-  │ jetstream.events_stream  │ StreamConfig  │ —             │ —           │ see below             │ stream        │
-  │                          │               │               │             │                       │ config.       │
-  ├──────────────────────────┼───────────────┼───────────────┼─────────────┼───────────────────────┼───────────────┤
-  │                          │               │               │             │                       │ RSFGA_DLQ     │
-  │ jetstream.dlq_stream     │ StreamConfig  │ —             │ —           │ see below             │ stream        │
-  │                          │               │               │             │                       │ config.       │
-  └──────────────────────────┴───────────────┴───────────────┴─────────────┴───────────────────────┴───────────────┘
-
-  StreamConfig fields:
-
-  ┌──────────────────┬─────────────┬───────────────────┬─────────────────────────────┬──────────────────────────────┐
-  │      Field       │    Type     │    Type range     │ Default (WRITES / EVENTS /  │         Description          │
-  │                  │             │                   │            DLQ)             │                              │
-  ├──────────────────┼─────────────┼───────────────────┼─────────────────────────────┼──────────────────────────────┤
-  │ name             │ String      │ —                 │ RSFGA_WRITES / RSFGA_EVENTS │ JetStream stream name.       │
-  │                  │             │                   │  / RSFGA_DLQ                │                              │
-  ├──────────────────┼─────────────┼───────────────────┼─────────────────────────────┼──────────────────────────────┤
-  │ subjects         │ Vec<String> │ —                 │ per-stream subjects         │ NATS subject filters.        │
-  ├──────────────────┼─────────────┼───────────────────┼─────────────────────────────┼──────────────────────────────┤
-  │ storage          │ StorageType │ File/Memory       │ File / File / File          │ Persistence type.            │
-  ├──────────────────┼─────────────┼───────────────────┼─────────────────────────────┼──────────────────────────────┤
-  │ replicas         │ u32         │ 0–4,294,967,295   │ 1                           │ Number of stream replicas.   │
-  ├──────────────────┼─────────────┼───────────────────┼─────────────────────────────┼──────────────────────────────┤
-  │ max_messages     │ i64         │ i64::MIN–i64::MAX │ -1 (unlimited)              │ Max messages retained; -1 =  │
-  │                  │             │                   │                             │ unlimited.                   │
-  ├──────────────────┼─────────────┼───────────────────┼─────────────────────────────┼──────────────────────────────┤
-  │ max_bytes        │ i64         │ i64::MIN–i64::MAX │ -1 (unlimited)              │ Max bytes retained; -1 =     │
-  │                  │             │                   │                             │ unlimited.                   │
-  ├──────────────────┼─────────────┼───────────────────┼─────────────────────────────┼──────────────────────────────┤
-  │ max_message_size │ i32         │ i32::MIN–i32::MAX │ 1,048,576 (1 MB)            │ Per-message size cap in      │
-  │                  │             │                   │                             │ bytes.                       │
-  ├──────────────────┼─────────────┼───────────────────┼─────────────────────────────┼──────────────────────────────┤
-  │ max_age_secs     │ u64         │ 0–∞               │ 0 (∞) / 604,800 (7d) /      │ Message retention age; 0 =   │
-  │                  │             │                   │ 604,800 (7d)                │ no age limit.                │
-  └──────────────────┴─────────────┴───────────────────┴─────────────────────────────┴──────────────────────────────┘
-
-  ---
-  14 · NATS Publisher (rsfga-nats/src/publisher.rs → PublisherConfig)
-
-  ┌───────────────────────────┬──────────┬─────────────────┬──────────────┬─────────┬───────────────────────────────┐
-  │           Field           │   Type   │   Type range    │  Explicit    │ Default │          Description          │
-  │                           │          │                 │  constraint  │         │                               │
-  ├───────────────────────────┼──────────┼─────────────────┼──────────────┼─────────┼───────────────────────────────┤
-  │ publish_timeout           │ Duration │ 0–∞             │ —            │ 5s      │ Timeout for each NATS publish │
-  │                           │          │                 │              │         │  attempt.                     │
-  ├───────────────────────────┼──────────┼─────────────────┼──────────────┼─────────┼───────────────────────────────┤
-  │ max_retries               │ u32      │ 0–4,294,967,295 │ —            │ 3       │ Retry count on publish        │
-  │                           │          │                 │              │         │ failure.                      │
-  ├───────────────────────────┼──────────┼─────────────────┼──────────────┼─────────┼───────────────────────────────┤
-  │                           │          │                 │              │         │ Base delay between retries    │
-  │ retry_delay               │ Duration │ 0–∞             │ —            │ 100ms   │ (exponential backoff: 100ms → │
-  │                           │          │                 │              │         │  200ms → 400ms).              │
-  ├───────────────────────────┼──────────┼─────────────────┼──────────────┼─────────┼───────────────────────────────┤
-  │ circuit_breaker_threshold │ u32      │ 0–4,294,967,295 │ —            │ 5       │ Consecutive failures to open  │
-  │                           │          │                 │              │         │ circuit breaker.              │
-  ├───────────────────────────┼──────────┼─────────────────┼──────────────┼─────────┼───────────────────────────────┤
-  │ circuit_breaker_reset     │ Duration │ 0–∞             │ —            │ 30s     │ Time circuit stays open       │
-  │                           │          │                 │              │         │ before auto-reset attempt.    │
-  ├───────────────────────────┼──────────┼─────────────────┼──────────────┼─────────┼───────────────────────────────┤
-  │ write_ticket_ttl          │ Duration │ 0–∞             │ —            │ 60s     │ TTL for RYOW write tickets    │
-  │                           │          │                 │              │         │ stored in the tracker.        │
-  └───────────────────────────┴──────────┴─────────────────┴──────────────┴─────────┴───────────────────────────────┘
-
-  ---
-  15 · Write Tracker (rsfga-nats/src/tracker.rs → WriteTrackerConfig)
-
-  ┌──────────────────┬──────────┬───────────┬─────────┬─────────────────────────────────────────────────────────────┐
-  │      Field       │   Type   │   Type    │ Default │                         Description                         │
-  │                  │          │   range   │         │                                                             │
-  ├──────────────────┼──────────┼───────────┼─────────┼─────────────────────────────────────────────────────────────┤
-  │ waiter_ttl       │ Duration │ 0–∞       │ 60s     │ Max time a waiter waits for commit notification before      │
-  │                  │          │           │         │ timing out.                                                 │
-  ├──────────────────┼──────────┼───────────┼─────────┼─────────────────────────────────────────────────────────────┤
-  │ cleanup_interval │ Duration │ 0–∞       │ 30s     │ How often the background task evicts expired waiters.       │
-  └──────────────────┴──────────┴───────────┴─────────┴─────────────────────────────────────────────────────────────┘
-
-  ---
-  16 · Write Consumer (rsfga-writer/src/consumer.rs → ConsumerConfig)
-
-  ┌────────────────────┬──────────┬──────────┬─────────────┬──────────────────────────────┬────────────────────────┐
-  │       Field        │   Type   │  Type    │  Explicit   │           Default            │      Description       │
-  │                    │          │  range   │ constraint  │                              │                        │
-  ├────────────────────┼──────────┼──────────┼─────────────┼──────────────────────────────┼────────────────────────┤
-  │                    │          │          │             │                              │ Durable consumer name  │
-  │ consumer_name      │ String   │ —        │ Non-empty   │ "rsfga-writer-1" (implied)   │ in NATS. Must be       │
-  │                    │          │          │             │                              │ unique per writer      │
-  │                    │          │          │             │                              │ instance.              │
-  ├────────────────────┼──────────┼──────────┼─────────────┼──────────────────────────────┼────────────────────────┤
-  │                    │          │          │             │                              │ Messages fetched per   │
-  │ batch_size         │ usize    │ 0–2⁶⁴−1  │ 1–10,000    │ —                            │ pull batch before      │
-  │                    │          │          │             │                              │ flushing.              │
-  ├────────────────────┼──────────┼──────────┼─────────────┼──────────────────────────────┼────────────────────────┤
-  │                    │          │          │             │                              │ Flush after idle for   │
-  │ batch_timeout      │ Duration │ 0–∞      │ 10ms–60s    │ —                            │ this duration even if  │
-  │                    │          │          │             │                              │ batch not full.        │
-  ├────────────────────┼──────────┼──────────┼─────────────┼──────────────────────────────┼────────────────────────┤
-  │                    │          │ 0–18.4 × │ 0 =         │ 5                            │ Deliveries before      │
-  │ max_delivery_count │ u64      │  10¹⁸    │ disabled    │ (DEFAULT_MAX_DELIVERY_COUNT) │ treating message as    │
-  │                    │          │          │             │                              │ poison → DLQ.          │
-  └────────────────────┴──────────┴──────────┴─────────────┴──────────────────────────────┴────────────────────────┘
-
-  Module-level constants (not in struct but govern behavior):
-
-  ┌───────────────────────────────────┬────────┬─────────────────────────────────────────────────────┐
-  │             Constant              │ Value  │                     Description                     │
-  ├───────────────────────────────────┼────────┼─────────────────────────────────────────────────────┤
-  │ MAX_PENDING_QUEUE_SIZE            │ 50,000 │ Force flush when in-flight queue reaches this size. │
-  ├───────────────────────────────────┼────────┼─────────────────────────────────────────────────────┤
-  │ STORAGE_CIRCUIT_BREAKER_THRESHOLD │ 5      │ Consecutive storage failures before circuit opens.  │
-  ├───────────────────────────────────┼────────┼─────────────────────────────────────────────────────┤
-  │ STORAGE_HEALTH_PROBE_INTERVAL     │ 10s    │ How often to probe storage when circuit is open.    │
-  ├───────────────────────────────────┼────────┼─────────────────────────────────────────────────────┤
-  │ DLQ_PUBLISH_TIMEOUT               │ 5s     │ Timeout for DLQ publish operations.                 │
-  └───────────────────────────────────┴────────┴─────────────────────────────────────────────────────┘
-
-  ---
-  17 · Edge Consumer (rsfga-edge/src/consumer.rs → EdgeConsumerConfig)
-
-  ┌────────────────────┬─────────────────────────┬─────────┬──────────────┬────────────────┬────────────────────────┐
-  │       Field        │          Type           │  Type   │  Explicit    │    Default     │      Description       │
-  │                    │                         │  range  │  constraint  │                │                        │
-  ├────────────────────┼─────────────────────────┼─────────┼──────────────┼────────────────┼────────────────────────┤
-  │                    │                         │         │              │                │ Durable consumer name; │
-  │ consumer_name      │ String                  │ —       │ Non-empty    │ "rsfga-edge-1" │  must be unique per    │
-  │                    │                         │         │              │                │ edge instance.         │
-  ├────────────────────┼─────────────────────────┼─────────┼──────────────┼────────────────┼────────────────────────┤
-  │                    │                         │ None /  │              │                │ None = full replica    │
-  │ store_filter       │ Option<HashSet<String>> │ set     │ —            │ None           │ (all stores); Some =   │
-  │                    │                         │         │              │                │ only those store IDs.  │
-  ├────────────────────┼─────────────────────────┼─────────┼──────────────┼────────────────┼────────────────────────┤
-  │ batch_size         │ usize                   │ 0–2⁶⁴−1 │ —            │ 100            │ Messages per pull      │
-  │                    │                         │         │              │                │ batch.                 │
-  ├────────────────────┼─────────────────────────┼─────────┼──────────────┼────────────────┼────────────────────────┤
-  │ fetch_timeout      │ Duration                │ 0–∞     │ —            │ 500ms          │ Pull-fetch block       │
-  │                    │                         │         │              │                │ timeout.               │
-  ├────────────────────┼─────────────────────────┼─────────┼──────────────┼────────────────┼────────────────────────┤
-  │                    │                         │         │              │                │ Deliveries before      │
-  │ max_delivery_count │ u64                     │ 0–∞     │ 0 = disabled │ 10             │ acking a poison        │
-  │                    │                         │         │              │                │ message.               │
-  └────────────────────┴─────────────────────────┴─────────┴──────────────┴────────────────┴────────────────────────┘
-
-  Module-level constant:
-
-  ┌──────────────────────┬────────┬──────────────────────────────────────────────────────────────────────────────────┐
-  │       Constant       │ Value  │                                   Description                                    │
-  ├──────────────────────┼────────┼──────────────────────────────────────────────────────────────────────────────────┤
-  │ MAX_PENDING_SET_SIZE │ 10,000 │ Max out-of-order sequences tracked per store before force-advancing the          │
-  │                      │        │ watermark.                                                                       │
-  └──────────────────────┴────────┴──────────────────────────────────────────────────────────────────────────────────┘
-
-  ---
-  18 · Precompute Worker (rsfga-precompute/src/config.rs → PrecomputeConfig)
-
-  ┌─────────────────┬──────────┬──────────┬───────────────┬──────────────────────┬──────────────────────────────────┐
-  │      Field      │   Type   │  Type    │   Explicit    │       Default        │           Description            │
-  │                 │          │  range   │  constraint   │                      │                                  │
-  ├─────────────────┼──────────┼──────────┼───────────────┼──────────────────────┼──────────────────────────────────┤
-  │ consumer_name   │ String   │ —        │ —             │ "rsfga-precompute-1" │ NATS durable consumer name.      │
-  ├─────────────────┼──────────┼──────────┼───────────────┼──────────────────────┼──────────────────────────────────┤
-  │ workers         │ usize    │ 0–2⁶⁴−1  │ —             │ 4                    │ Parallel worker tasks consuming  │
-  │                 │          │          │               │                      │ from the hot-path queue.         │
-  ├─────────────────┼──────────┼──────────┼───────────────┼──────────────────────┼──────────────────────────────────┤
-  │                 │          │          │               │                      │ Window to accumulate check       │
-  │ batch_window    │ Duration │ 0–∞      │ —             │ 50ms                 │ requests before                  │
-  │                 │          │          │               │                      │ batch-processing.                │
-  ├─────────────────┼──────────┼──────────┼───────────────┼──────────────────────┼──────────────────────────────────┤
-  │                 │          │          │               │                      │ Max pending items in the         │
-  │ max_queue_depth │ usize    │ 0–2⁶⁴−1  │ —             │ 10,000               │ precompute queue before          │
-  │                 │          │          │               │                      │ backpressure.                    │
-  ├─────────────────┼──────────┼──────────┼───────────────┼──────────────────────┼──────────────────────────────────┤
-  │ fetch_timeout   │ Duration │ 0–∞      │ —             │ 500ms                │ NATS pull fetch block timeout.   │
-  └─────────────────┴──────────┴──────────┴───────────────┴──────────────────────┴──────────────────────────────────┘
-
-  ---
-  19 · Valkey / Redis (rsfga-valkey/src/client.rs → ValkeyConfig)
-
-  Field: url
-  Type: String
-  Type range: —
-  Explicit constraint: Non-empty (validated at connect)
-  Default: "redis://localhost:6379"
-  Description: Connection URL. Accepts redis://, rediss://, redis+sentinel://, redis+unix://. Credentials redacted in
-    logs.
-  ────────────────────────────────────────
-  Field: result_ttl_secs
-  Type: u64
-  Type range: 0–∞
-  Explicit constraint: > 0 (when precompute enabled)
-  Default: 300 (5 min)
-  Description: TTL for precomputed check results. Short because stale auth results are a correctness risk.
-  ────────────────────────────────────────
-  Field: hotpath_ttl_secs
-  Type: u64
-  Type range: 0–∞
-  Explicit constraint: > 0 (when precompute enabled)
-  Default: 3,600 (1 h)
-  Description: TTL for hot-path access-pattern metadata (sorted set). Longer because these track frequency, not
-  outcomes.
-
-  ---
-  20 · Precompute / Server integration (ServerConfig → PrecomputeSettings)
-
-  Mirrors ValkeyConfig with the addition of an enabled gate:
-
-  ┌──────────────────┬────────┬────────────────┬──────────────────────────┬─────────────────────────────────────────┐
-  │      Field       │  Type  │   Explicit     │         Default          │               Description               │
-  │                  │        │   constraint   │                          │                                         │
-  ├──────────────────┼────────┼────────────────┼──────────────────────────┼─────────────────────────────────────────┤
-  │ enabled          │ bool   │ —              │ false                    │ Enable precompute cache lookups. No-op  │
-  │                  │        │                │                          │ without --features precompute.          │
-  ├──────────────────┼────────┼────────────────┼──────────────────────────┼─────────────────────────────────────────┤
-  │ valkey_url       │ String │ Non-empty when │ "redis://localhost:6379" │ Passed to ValkeyClient::connect().      │
-  │                  │        │  enabled       │                          │                                         │
-  ├──────────────────┼────────┼────────────────┼──────────────────────────┼─────────────────────────────────────────┤
-  │ result_ttl_secs  │ u64    │ > 0 when       │ 300                      │ Forwarded to ValkeyConfig.              │
-  │                  │        │ enabled        │                          │                                         │
-  ├──────────────────┼────────┼────────────────┼──────────────────────────┼─────────────────────────────────────────┤
-  │ hotpath_ttl_secs │ u64    │ > 0 when       │ 3,600                    │ Forwarded to ValkeyConfig.              │
-  │                  │        │ enabled        │                          │                                         │
-  └──────────────────┴────────┴────────────────┴──────────────────────────┴─────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────┐
+  │                    Config                     │                              Rule                               │
+  ├───────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ server.port                                   │ Must be > 0                                                     │
+  ├───────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ storage.backend                               │ Must be one of the 5 listed values                              │
+  ├───────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ storage.database_url                          │ Required (non-empty) when backend is postgres/mysql/cockroachdb │
+  ├───────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ storage.data_path                             │ Required (non-empty) when backend is rocksdb                    │
+  ├───────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ logging.level                                 │ Must be a valid level name                                      │
+  ├───────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ nats.write_mode                               │ Must be nats/direct/auto (only checked when nats.enabled=true)  │
+  ├───────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ precompute.valkey_url                         │ Non-empty when precompute.enabled=true                          │
+  ├───────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ precompute.result_ttl_secs / hotpath_ttl_secs │ Must be > 0 when precompute.enabled=true                        │
+  └───────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────┘
