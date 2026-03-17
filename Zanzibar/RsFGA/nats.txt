@@ -1,0 +1,217 @@
+ ---
+  NATS Architecture Overview
+
+  NATS is used for async writes only — reads (Check, ListObjects, ListUsers, Read) always go directly to the DB. The
+  purpose is to decouple write throughput from database latency.
+
+  Client
+    │  POST /async/stores/:id/write
+    ▼
+  API Layer ──publish──▶ NATS JetStream (RSFGA_WRITES)
+    │                              │
+    │ returns WriteTicket          │ pull
+    ▼                              ▼
+  Client (optionally         WriteConsumer (rsfga-writer)
+  waits for RYOW)                  │
+                              batch + write to DB
+                                   │
+                              publish CommittedEvent
+                                   │
+                                   ▼
+                           NATS JetStream (RSFGA_EVENTS)
+                                   │
+                            ┌──────┴──────┐
+                            ▼             ▼
+                      WriteTracker   EdgeSyncConsumer
+                      (RYOW wakeup)  (edge DB sync)
+
+  ---
+  3 JetStream Streams
+
+  ┌──────────────┬─────────────────┬───────────────────────────────┬────────────────────────┐
+  │    Stream    │ Subject pattern │           Retention           │        Purpose         │
+  ├──────────────┼─────────────────┼───────────────────────────────┼────────────────────────┤
+  │ RSFGA_WRITES │ rsfga.writes.*  │ WorkQueue (deleted after ack) │ Pending write requests │
+  ├──────────────┼─────────────────┼───────────────────────────────┼────────────────────────┤
+  │ RSFGA_EVENTS │ rsfga.events.>  │ Limits (7-day default)        │ Committed write events │
+  ├──────────────┼─────────────────┼───────────────────────────────┼────────────────────────┤
+  │ RSFGA_DLQ    │ rsfga.dlq.*     │ Limits (7-day default)        │ Poison/failed messages │
+  └──────────────┴─────────────────┴───────────────────────────────┴────────────────────────┘
+
+  Subjects are store-scoped: rsfga.writes.{store_id}, rsfga.events.{store_id}.committed.
+
+  ---
+  Message Schemas
+
+  WriteRequest — published by API to RSFGA_WRITES:
+  {
+    "request_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "store_id": "store-01",
+    "writes": [
+      { "user": "user:alice", "relation": "viewer", "object": "document:readme",
+        "condition": { "name": "ip_range", "context": { "allowed_ips": "10.0.0.0/8" } } }
+    ],
+    "deletes": [
+      { "user": "user:bob", "relation": "editor", "object": "document:readme" }
+    ],
+    "metadata": { "trace_id": "...", "client_id": "...", "source_ip": "..." },
+    "created_at": "2026-03-16T10:00:00Z"
+  }
+
+  CommittedEvent — published by WriteConsumer to RSFGA_EVENTS after DB write:
+  {
+    "event_id": "...",
+    "sequence": 42,
+    "request_ids": ["01ARZ3..."],
+    "writes": [...],
+    "deletes": [...],
+    "committed_at": "...",
+    "model_changed": false
+  }
+
+  WriteTicket — returned immediately to the caller:
+  {
+    "store_id": "store-01",
+    "sequence": 42,
+    "request_id": "01ARZ3...",
+    "expires_at": "..."  // 60 seconds from now
+  }
+
+  ---
+  Write Flow (Step by Step)
+
+  1. API publishes to NATS (publisher.rs)
+
+  POST /async/stores/store-01/write
+          │
+          ▼
+  EventPublisher::publish_write_request()
+    ├─ Serialize WriteRequest to JSON
+    ├─ Set NATS message ID = request_id  (dedup key)
+    ├─ Publish to "rsfga.writes.store-01"
+    │    └─ Retry up to 3× with 100ms exponential backoff on failure
+    │    └─ Circuit breaker: opens after 5 consecutive failures (30s reset)
+    └─ Returns WriteTicket { store_id, sequence, request_id, expires_at: +60s }
+
+  WriteMode controls fallback behavior (routes.rs):
+  - Nats — NATS only, error if unavailable
+  - Direct — bypass NATS, write synchronously to storage
+  - Auto — try NATS, fall back to sync storage on failure (fallback: true in response)
+
+  ---
+  2. WriteConsumer pulls and commits (rsfga-writer/src/consumer.rs)
+
+  The consumer is a durable pull consumer on RSFGA_WRITES.
+
+  Loop:
+    ├─ Check shutdown signal
+    ├─ Check circuit breaker (open? → probe DB health every 10s, skip fetch)
+    ├─ Check pending queue size (≥50,000? → force flush first)
+    ├─ Pull batch of messages (default: 100)
+    │
+    └─ For each message:
+         ├─ Check delivery count > max_delivery_count (5)?
+         │    └─ Yes → DLQ(MaxRetriesExceeded), ack, skip
+         ├─ Parse JSON → WriteRequest
+         │    └─ Fail → DLQ(ParseError), ack, skip
+         └─ Add to pending batch grouped by store_id
+
+    Flush when (batch_timeout OR batch full):
+      process_batch():
+        1. storage.write_tuples() [idempotent via ON CONFLICT]
+           └─ Failure → retry 3× with exp backoff (100ms, 200ms, 400ms)
+           └─ All fail → circuit opens after 5 consecutive, stop fetching
+        2. Publish CommittedEvent to RSFGA_EVENTS
+           └─ max_stream_sequence as the event sequence
+           └─ Retry 3×
+           └─ All fail → DLQ(EventPublishFailed), ack anyway
+              (storage already committed — acking prevents duplicate writes)
+        3. Ack all messages in batch
+
+  The circuit breaker is the safety valve: if MySQL is down, the consumer stops pulling from NATS entirely and probes
+  health every 10 seconds. This prevents unbounded redeliveries from burning through max_delivery_count unnecessarily.
+
+  ---
+  RYOW — Read Your Own Writes (tracker.rs)
+
+  The problem: after an async write, a client's subsequent check() might hit a DB replica that hasn't applied the write
+  yet.
+
+  Solution: WriteTracker + WriteTicket.
+
+  // Data structures
+  committed: DashMap<store_id, Arc<AtomicU64>>  // highest committed sequence per store
+  waiters:   DashMap<(store_id, sequence), Vec<oneshot::Sender>>  // pending RYOW waiters
+
+  Flow:
+
+  Client writes → gets WriteTicket { store_id: "store-01", sequence: 42 }
+         │
+         ▼
+  Client calls check() with write_ticket in body
+         │
+         ▼
+  wait_for_commit("store-01", 42, timeout=5s):
+    ├─ Fast path: committed["store-01"].load() >= 42 → return immediately
+    ├─ Slow path: register oneshot channel in waiters[("store-01", 42)]
+    │             double-check committed (TOCTOU prevention)
+    └─ Await oneshot receiver (or timeout → 504)
+         │
+         ▼  (concurrently, when CommittedEvent arrives)
+  mark_committed("store-01", sequence=42):
+    ├─ committed["store-01"].fetch_max(42)  // monotonic advance
+    └─ waiters.retain: for all entries with sequence <= 42, fire sender
+         └─ Woken waiters return from wait_for_commit() → check() proceeds
+
+  A cleanup task runs every 30s to evict expired waiters (TTL: 60s), preventing unbounded memory growth. It also warns
+  if >10,000 waiters exist.
+
+  Additionally, the Consistency-Level: strong HTTP header can be used instead of a ticket — it waits for the latest
+  committed sequence for that store before proceeding with the check.
+
+  ---
+  Edge Sync Consumer (rsfga-edge/src/consumer.rs)
+
+  The edge consumer subscribes to RSFGA_EVENTS and applies committed writes to a local edge database — used for
+  geographically distributed deployments.
+
+  It handles out-of-order delivery via EdgeSyncWatermark:
+
+  struct EdgeSyncWatermark {
+      contiguous: u64,          // highest sequence where all 1..=N have been applied
+      pending: BTreeSet<u64>,   // out-of-order applied sequences waiting to be contiguous
+  }
+
+  fn advance(sequence):
+    pending.insert(sequence)
+    while pending.contains(contiguous + 1):
+      contiguous += 1
+      pending.remove(contiguous)
+
+  - If sequence <= watermark.contiguous → already applied, skip (idempotency)
+  - If pending.len() > 10,000 → force-advance watermark (bounded memory; logs warning)
+  - Storage writes use ON CONFLICT for idempotency on redelivery
+  - Per-store filter: edge instances can subscribe to only a subset of stores
+
+  ---
+  Failure Handling Summary
+
+  ┌─────────────────────────────────────┬───────────────────────────────────────────────────────────────────────┐
+  │               Failure               │                               Behavior                                │
+  ├─────────────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ NATS publish timeout                │ Retry 3×, exp backoff (100ms base)                                    │
+  ├─────────────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ NATS circuit open                   │ Fast-fail all publishes, reset after 30s                              │
+  ├─────────────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ Malformed message in consumer       │ → DLQ(ParseError), ack, continue                                      │
+  ├─────────────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ Message delivered >5 times          │ → DLQ(MaxRetriesExceeded), ack, continue                              │
+  ├─────────────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ DB write fails in consumer          │ Retry 3×; after 5 consecutive failures → circuit opens, stop fetching │
+  ├─────────────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ Event publish fails after DB commit │ → DLQ(EventPublishFailed), ack anyway (storage already has the write) │
+  ├─────────────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ RYOW wait times out                 │ 504 Gateway Timeout returned to client                                │
+  ├─────────────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
+  │ Edge out-of-order events            │ Buffered in pending BTreeSet, applied when gap fills                  │
+  └─────────────────────────────────────┴───────────────────────────────────────────────────────────────────────┘

@@ -1,0 +1,106 @@
+---
+  Cache Invalidation: Two Caches, Different Granularity
+
+  There are two separate caches that get invalidated independently:
+
+  ┌──────────────────────┬───────────────────────────────────────────┬────────────────────────────────────┐
+  │        Cache         │              What it stores               │      Invalidation granularity      │
+  ├──────────────────────┼───────────────────────────────────────────┼────────────────────────────────────┤
+  │ CheckCache (Moka)    │ (store_id, object, relation, user) → bool │ Store-wide in practice (see below) │
+  ├──────────────────────┼───────────────────────────────────────────┼────────────────────────────────────┤
+  │ global_cache() (CEL) │ Parsed CEL expression ASTs                │ Global wipe                        │
+  └──────────────────────┴───────────────────────────────────────────┴────────────────────────────────────┘
+
+  ---
+  CheckCache — 4 Invalidation Methods
+
+  The cache has fine-grained APIs, but they're not all used the same way:
+
+  invalidate(key) — exact key, O(1)
+
+  // Single entry removal. Removes from Moka + both secondary indices.
+  cache.invalidate(&CacheKey { store_id, object, relation, user }).await;
+  Removes from: Moka cache + by_store[store_id] set + by_object[(store_id, object)] set.
+  Not called by any write handler — only used in tests.
+
+  invalidate_for_tuple(store_id, object, _relation) — by object, O(K)
+
+  // Invalidates ALL cache keys for (store_id, object), ignoring relation.
+  pub async fn invalidate_for_tuple(&self, store_id: &str, object: &str, _relation: &str)
+  //                                                                       ↑ underscore — unused!
+  Uses the by_object secondary index: DashMap<(String, String), HashSet<CacheKey>>.
+  Atomically removes the whole entry with .remove() (avoids TOCTOU), then calls cache.invalidate(key) for each.
+  Also not called by any write handler — only reachable via spawn_invalidation_for_tuple / timed_invalidate_for_tuple,
+  which are also unused in production paths. The _relation parameter is explicitly ignored — this is object-scoped, not
+  relation-scoped.
+
+  invalidate_store(store_id) — entire store, O(K)
+
+  // Invalidates ALL cache keys for a store.
+  pub async fn invalidate_store(&self, store_id: &str)
+  Uses the by_store secondary index: DashMap<String, HashSet<CacheKey>>.
+  Atomically removes the whole store entry, invalidates every key, then cleans up the by_object index.
+
+  invalidate_matching(predicate) — scan + filter, O(N)
+
+  // Runs a full cache scan and removes keys matching the predicate.
+  pub async fn invalidate_matching<F>(&self, predicate: F) where F: Fn(&CacheKey) -> bool
+  Calls cache.run_pending_tasks() first (flushes eviction queue), then iterates all entries.
+  Not called anywhere in production — only in tests.
+
+  ---
+  What Write Handlers Actually Call
+
+  Every single write handler uses the coarsest option — store-wide invalidation:
+
+  ┌────────────────────────────────────────────┬──────────────────────┬─────────────────────────────────────────────┐
+  │                  Trigger                   │       Handler        │             What's invalidated              │
+  ├────────────────────────────────────────────┼──────────────────────┼─────────────────────────────────────────────┤
+  │ POST /stores/:id/write (sync, HTTP)        │ routes.rs:2200       │ invalidate_store(store_id)                  │
+  ├────────────────────────────────────────────┼──────────────────────┼─────────────────────────────────────────────┤
+  │ Write gRPC                                 │ service.rs:951       │ invalidate_store(store_id)                  │
+  ├────────────────────────────────────────────┼──────────────────────┼─────────────────────────────────────────────┤
+  │ Async write fallback (NATS unavailable)    │ routes.rs:3718       │ invalidate_store(store_id)                  │
+  ├────────────────────────────────────────────┼──────────────────────┼─────────────────────────────────────────────┤
+  │ POST /stores/:id/write-authorization-model │ routes.rs:1002–1003  │ global_cache().invalidate_all() +           │
+  │  (HTTP)                                    │                      │ invalidate_store(store_id)                  │
+  ├────────────────────────────────────────────┼──────────────────────┼─────────────────────────────────────────────┤
+  │ WriteAuthorizationModel gRPC               │ service.rs:1661–1662 │ global_cache().invalidate_all() +           │
+  │                                            │                      │ invalidate_store(store_id)                  │
+  ├────────────────────────────────────────────┼──────────────────────┼─────────────────────────────────────────────┤
+  │ Async model write fallback                 │ routes.rs:3928–3929  │ global_cache().invalidate_all() +           │
+  │                                            │                      │ invalidate_store(store_id)                  │
+  └────────────────────────────────────────────┴──────────────────────┴─────────────────────────────────────────────┘
+
+  So in practice: tuple writes wipe the entire store's check cache; model writes additionally wipe all parsed CEL
+  expressions globally.
+
+  ---
+  Tuple Writes vs Model Writes: Why the Difference
+
+  Tuple write — only invalidate_store:
+  - A tuple write only affects authorization decisions for that store
+  - (store_id, object, relation, user) → bool entries for that store may now be wrong
+  - Other stores are unaffected
+
+  Model write — invalidate_all on CEL cache first, then invalidate_store:
+  - The CEL cache stores parsed expression ASTs keyed by expression string, shared across all stores
+  - A new model may define new conditions or redefine existing condition names
+  - Stale CEL ASTs from the old model could evaluate against the new model's data → wrong decisions (security
+  vulnerability)
+  - The comment at routes.rs:995 calls this out explicitly: invalidation happens before the DB write to prevent a race
+  where a concurrent check reads the new model but gets a cached result from the old one
+
+  ---
+  The Fine-Grained Infrastructure Isn't Wired Up
+
+  The comments in the write handlers say it directly:
+
+  routes.rs:2198: "Invalidate cache for this store to prevent stale auth decisions. This is a coarse-grained stopgap
+  until fine-grained invalidation is wired."
+
+  service.rs:949: Same comment verbatim.
+
+  The fine-grained path (invalidate_for_tuple per written tuple) exists in the cache API and has full test coverage, but
+   isn't connected to the write handlers. So today every tuple write that hits a store evicts all cached check results
+  for that store, regardless of which object or relation was touched.
