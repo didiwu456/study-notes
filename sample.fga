@@ -1,0 +1,53 @@
+model
+  schema 1.1
+
+type user
+
+type group
+  relations
+    define member: [user]
+
+type role
+  relations
+    # group slots on the role
+    define group_0: [group]
+    define group_1: [group]
+    define group_2: [group]
+    define group_3: [group]
+    define group_4: [group]
+    define group_5: [group]
+    define group_6: [group]
+    define group_7: [group]
+    define group_8: [group]
+    define group_9: [group]
+
+    # unrestricted flags for unused slots
+    define unrestricted_0: [role]
+    define unrestricted_1: [role]
+    define unrestricted_2: [role]
+    define unrestricted_3: [role]
+    define unrestricted_4: [role]
+    define unrestricted_5: [role]
+    define unrestricted_6: [role]
+    define unrestricted_7: [role]
+    define unrestricted_8: [role]
+    define unrestricted_9: [role]
+
+    define slot_0_ok: member from group_0 or self from unrestricted_0
+    define slot_1_ok: member from group_1 or self from unrestricted_1
+    define slot_2_ok: member from group_2 or self from unrestricted_2
+    define slot_3_ok: member from group_3 or self from unrestricted_3
+    define slot_4_ok: member from group_4 or self from unrestricted_4
+    define slot_5_ok: member from group_5 or self from unrestricted_5
+    define slot_6_ok: member from group_6 or self from unrestricted_6
+    define slot_7_ok: member from group_7 or self from unrestricted_7
+    define slot_8_ok: member from group_8 or self from unrestricted_8
+    define slot_9_ok: member from group_9 or self from unrestricted_9
+
+    define member: slot_0_ok and slot_1_ok and slot_2_ok and slot_3_ok and slot_4_ok and slot_5_ok and slot_6_ok and slot_7_ok and slot_8_ok and slot_9_ok
+
+type document
+  relations
+    define direct_viewer: [user]
+    define role_viewer: [role]
+    define viewer: direct_viewer or member from role_viewer
